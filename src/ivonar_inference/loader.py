@@ -17,6 +17,14 @@ PACKED_FORMAT = "ivonar_packed_ternary_inference"
 PACKED_SCHEMA_VERSION = 1
 
 
+def resolve_device(requested: str = "auto") -> str:
+    """Turn ``auto`` into the fastest device this machine can actually run."""
+
+    if requested.strip().lower() != "auto":
+        return requested
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 @dataclass(frozen=True)
 class LoadedModel:
     model: IvonarModel
@@ -166,7 +174,9 @@ def load_model(
         if tokenizer_sha256 is None:
             raise RuntimeError("checkpoint is missing tokenizer_sha256")
         if tokenizer_sha256 != str(expected_tokenizer_sha256):
-            raise RuntimeError(f"tokenizer SHA-256 mismatch: expected {expected_tokenizer_sha256}, found {tokenizer_sha256}")
+            raise RuntimeError(
+                f"tokenizer SHA-256 mismatch: expected {expected_tokenizer_sha256}, found {tokenizer_sha256}"
+            )
     state = payload.get("model_state")
     if not isinstance(state, dict):
         raise RuntimeError("checkpoint model_state is invalid")

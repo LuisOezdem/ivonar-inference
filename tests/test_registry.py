@@ -117,7 +117,6 @@ def test_the_stream_reports_context_use_and_drops_old_turns(client: TestClient) 
     first = _send(client, chat, "one two three")
     assert first["done"] is True and first["context_tokens"] == 64
     assert first["dropped_messages"] == 0 and first["prompt_tokens"] > 0
-    # Every turn adds tokens, so the oldest ones have to go before the context fills.
     dropped = 0
     for _ in range(6):
         dropped += _send(client, chat, "another question about the topic")["dropped_messages"]

@@ -185,9 +185,9 @@ def create_app(
     @app.post("/v1/chat/completions")
     def chat_completions(request: ChatCompletionRequest):
         current = active()
-        known = (
-            {entry.name for entry in registry.entries()} if registry is not None else {current.info.model_id}
-        ) | {current.info.model_id}
+        known = ({entry.name for entry in registry.entries()} if registry is not None else {current.info.model_id}) | {
+            current.info.model_id
+        }
         if request.model is not None and request.model not in known:
             raise HTTPException(status_code=404, detail=f"unknown model: {request.model}")
         if registry is not None and request.model is not None and request.model != registry.current:

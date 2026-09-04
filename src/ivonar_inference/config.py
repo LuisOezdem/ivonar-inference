@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-# The architecture contract every Ivonar checkpoint must declare.
 _REQUIRED_CONTRACT = {
     "architecture": "ivonar_native_ternary",
     "architecture_version": 1,
@@ -43,7 +42,9 @@ class ModelConfig:
     def from_payload(cls, config: Any) -> "ModelConfig":
         if not isinstance(config, dict):
             raise ValueError("checkpoint config is invalid")
-        mismatches = [f"{key}={config.get(key)!r}" for key, expected in _REQUIRED_CONTRACT.items() if config.get(key) != expected]
+        mismatches = [
+            f"{key}={config.get(key)!r}" for key, expected in _REQUIRED_CONTRACT.items() if config.get(key) != expected
+        ]
         if mismatches:
             raise ValueError("incompatible Ivonar checkpoint: " + ", ".join(mismatches))
         if int(config.get("num_experts", 0)) > 0:
@@ -64,7 +65,9 @@ class ModelConfig:
             num_heads=int(config["num_heads"]),
             state_dim=int(config["state_dim"]),
             layer_types=layer_types,
-            dense_dim=int(config.get("dense_intermediate_dim", 0) or max(int(config.get("intermediate_dim", 0)), 4 * hidden_dim)),
+            dense_dim=int(
+                config.get("dense_intermediate_dim", 0) or max(int(config.get("intermediate_dim", 0)), 4 * hidden_dim)
+            ),
             latent_dim=int(config.get("mla_latent_dim", 0) or max(128, hidden_dim // 4)),
             base_context=int(config.get("base_context", 8192)),
             final_context=int(config.get("final_context", 8192)),

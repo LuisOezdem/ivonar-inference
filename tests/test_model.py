@@ -14,9 +14,31 @@ from conftest import CONTRACT, tiny_config, tiny_state, tiny_tokenizer_file
 
 def test_config_rejects_other_architectures_and_experts() -> None:
     with pytest.raises(ValueError, match="incompatible"):
-        ModelConfig.from_payload({**CONTRACT, "architecture_version": 2, "vocab_size": 10, "seq_len": 4, "hidden_dim": 4, "num_layers": 1, "num_heads": 1, "state_dim": 1})
+        ModelConfig.from_payload(
+            {
+                **CONTRACT,
+                "architecture_version": 2,
+                "vocab_size": 10,
+                "seq_len": 4,
+                "hidden_dim": 4,
+                "num_layers": 1,
+                "num_heads": 1,
+                "state_dim": 1,
+            }
+        )
     with pytest.raises(ValueError, match="mixture-of-experts"):
-        ModelConfig.from_payload({**CONTRACT, "num_experts": 4, "vocab_size": 10, "seq_len": 4, "hidden_dim": 4, "num_layers": 1, "num_heads": 1, "state_dim": 1})
+        ModelConfig.from_payload(
+            {
+                **CONTRACT,
+                "num_experts": 4,
+                "vocab_size": 10,
+                "seq_len": 4,
+                "hidden_dim": 4,
+                "num_layers": 1,
+                "num_heads": 1,
+                "state_dim": 1,
+            }
+        )
     config = tiny_config()
     assert config.layer_types == ("mamba", "mla", "mamba")
     assert config.latent_dim == 8 and config.dense_dim == 32
@@ -61,7 +83,21 @@ def _write_checkpoint(path: Path, config: ModelConfig, tokenizer_sha256: str | N
     payload = {
         "format": PACKED_FORMAT,
         "schema_version": PACKED_SCHEMA_VERSION,
-        "config": {**CONTRACT, "name": config.name, "vocab_size": config.vocab_size, "seq_len": config.seq_len, "hidden_dim": config.hidden_dim, "num_layers": config.num_layers, "num_heads": config.num_heads, "state_dim": config.state_dim, "layer_types": list(config.layer_types), "dense_intermediate_dim": config.dense_dim, "mla_latent_dim": config.latent_dim, "base_context": config.base_context, "final_context": config.final_context},
+        "config": {
+            **CONTRACT,
+            "name": config.name,
+            "vocab_size": config.vocab_size,
+            "seq_len": config.seq_len,
+            "hidden_dim": config.hidden_dim,
+            "num_layers": config.num_layers,
+            "num_heads": config.num_heads,
+            "state_dim": config.state_dim,
+            "layer_types": list(config.layer_types),
+            "dense_intermediate_dim": config.dense_dim,
+            "mla_latent_dim": config.latent_dim,
+            "base_context": config.base_context,
+            "final_context": config.final_context,
+        },
         "model_state": tiny_state(config, seed=2),
         "lineup": "nano",
         "stage": "sft",
@@ -93,7 +129,13 @@ def test_load_model_checks_format_and_tokenizer(tmp_path: Path) -> None:
     assert engine.info.context_tokens == 32 and engine.info.graph is False
     result = engine.complete([{"role": "user", "content": "hi"}], GenerationSettings(max_tokens=8))
     assert isinstance(result.text, str) and result.finish_reason in {"stop", "length"}
-    assert engine.decoder.host_position <= engine.count_tokens(engine.build_prompt([{"role": "user", "content": "hi"}], GenerationSettings(max_tokens=8))[0]) + 8
+    assert (
+        engine.decoder.host_position
+        <= engine.count_tokens(
+            engine.build_prompt([{"role": "user", "content": "hi"}], GenerationSettings(max_tokens=8))[0]
+        )
+        + 8
+    )
 
 
 def test_tokenizer_python_backend_round_trips(tmp_path: Path) -> None:

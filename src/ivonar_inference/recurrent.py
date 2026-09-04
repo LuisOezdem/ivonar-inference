@@ -64,7 +64,10 @@ class RecurrentMixer(nn.Module):
         self.head_dim = self.hidden_dim // self.num_heads
         self.dt_min = float(dt_min)
         self.dt_max = float(dt_max)
-        if tuple(log_decay.shape) != (self.num_heads, self.state_dim) or tuple(theta.shape) != (self.num_heads, self.state_dim):
+        if tuple(log_decay.shape) != (self.num_heads, self.state_dim) or tuple(theta.shape) != (
+            self.num_heads,
+            self.state_dim,
+        ):
             raise ValueError("log_decay and theta must have shape [num_heads, state_dim]")
         if tuple(skip.shape) != (self.num_heads, self.head_dim):
             raise ValueError("skip must have shape [num_heads, head_dim]")
@@ -168,7 +171,14 @@ class RecurrentMixer(nn.Module):
         for start in range(aligned_len, seq_len, chunk_length):
             end = min(start + chunk_length, seq_len)
             chunk_y, state, force = self._ssd_chunk(
-                drive[:, start:end], b_coeff[:, start:end], c_coeff[:, start:end], dt[:, start:end], state, force, decay, theta
+                drive[:, start:end],
+                b_coeff[:, start:end],
+                c_coeff[:, start:end],
+                dt[:, start:end],
+                state,
+                force,
+                decay,
+                theta,
             )
             outputs.append(chunk_y)
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1), state, force

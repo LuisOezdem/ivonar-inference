@@ -40,9 +40,7 @@ class ChatCompletionRequest(BaseModel):
             temperature=self.temperature if self.temperature is not None else defaults.temperature,
             top_k=self.top_k if self.top_k is not None else defaults.top_k,
             repetition_penalty=(
-                self.repetition_penalty
-                if self.repetition_penalty is not None
-                else defaults.repetition_penalty
+                self.repetition_penalty if self.repetition_penalty is not None else defaults.repetition_penalty
             ),
             stop=tuple(self.stop) if self.stop else defaults.stop,
         )
@@ -56,9 +54,7 @@ def model_card(model_id: str) -> dict[str, object]:
     return {"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "ivonar"}
 
 
-def completion_payload(
-    request_id: str, model_id: str, result: GenerationResult
-) -> dict[str, object]:
+def completion_payload(request_id: str, model_id: str, result: GenerationResult) -> dict[str, object]:
     return {
         "id": request_id,
         "object": "chat.completion",

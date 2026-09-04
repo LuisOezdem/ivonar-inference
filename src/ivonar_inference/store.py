@@ -49,10 +49,7 @@ class ChatStore:
             title=str(payload.get("title", "")),
             created=float(payload.get("created", 0.0)),
             updated=float(payload.get("updated", 0.0)),
-            messages=[
-                {"role": str(m["role"]), "content": str(m["content"])}
-                for m in payload.get("messages", [])
-            ],
+            messages=[{"role": str(m["role"]), "content": str(m["content"])} for m in payload.get("messages", [])],
         )
 
     def _write(self, chat: Chat) -> None:

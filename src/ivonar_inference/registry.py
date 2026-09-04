@@ -7,9 +7,7 @@ from pathlib import Path
 from .engine import Engine, GenerationSettings
 from .paths import available_models, model_name, resolve_model_path
 
-# Naming the model in its own system message makes it answer about itself
-# instead of the question, so the default stays plain.
-DEFAULT_SYSTEM = "You are a helpful assistant."
+DEFAULT_SYSTEM = "Your name is Ivonar. Give a helpful answer to what the user writes."
 
 
 @dataclass(frozen=True)

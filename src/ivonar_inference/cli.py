@@ -4,7 +4,10 @@ import argparse
 import sys
 from pathlib import Path
 
+import torch
+
 from .engine import Engine, GenerationSettings
+from .loader import resolve_device
 from .paths import resolve_model_path
 from .registry import DEFAULT_SYSTEM, ModelRegistry
 
@@ -16,7 +19,7 @@ def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
         "Without it the single model under models/ is used.",
     )
     parser.add_argument("--tokenizer", help="tokenizer.json; defaults to the file next to the model.")
-    parser.add_argument("--device", default="cpu", help="cpu or cuda.")
+    parser.add_argument("--device", default="auto", help="auto, cpu or cuda.")
     parser.add_argument(
         "--no-graph",
         action="store_true",
@@ -42,20 +45,31 @@ def _settings(args: argparse.Namespace) -> GenerationSettings:
     )
 
 
+def _load_engine(model_file: Path, args: argparse.Namespace, device: str) -> tuple[Engine, str]:
+    try:
+        engine = Engine.load(
+            model_file,
+            tokenizer_path=args.tokenizer,
+            device=device,
+            model_id=model_file.parent.name,
+            defaults=_settings(args),
+            graph=not args.no_graph,
+        )
+    except (torch.cuda.OutOfMemoryError, torch.AcceleratorError, OSError) as exc:
+        if device == "cpu":
+            raise
+        print(f"[INFO] {device} did not work ({type(exc).__name__}), falling back to the CPU", flush=True)
+        return _load_engine(model_file, args, "cpu")
+    return engine, device
+
+
 def _registry(args: argparse.Namespace) -> ModelRegistry:
     model_file = resolve_model_path(args.model)
-    engine = Engine.load(
-        model_file,
-        tokenizer_path=args.tokenizer,
-        device=args.device,
-        model_id=model_file.parent.name,
-        defaults=_settings(args),
-        graph=not args.no_graph,
-    )
+    engine, device = _load_engine(model_file, args, resolve_device(args.device))
     registry = ModelRegistry(
         engine,
         model_file,
-        device=args.device,
+        device=device,
         graph=not args.no_graph,
         defaults=engine.defaults,
         system=args.system,
@@ -71,6 +85,9 @@ def _report(registry: ModelRegistry) -> None:
         f"device={info.device} graph={info.graph}",
         flush=True,
     )
+    others = [entry.name for entry in registry.entries() if not entry.loaded]
+    if others:
+        print(f"[INFO] also installed: {', '.join(others)} (switch with /model, or in the app)", flush=True)
 
 
 def _serve(args: argparse.Namespace) -> int:
@@ -222,7 +239,10 @@ def _verify(args: argparse.Namespace) -> int:
     from .verify import verify_model
 
     check = verify_model(
-        resolve_model_path(args.model), tokenizer_path=args.tokenizer, device=args.device, graph=not args.no_graph
+        resolve_model_path(args.model),
+        tokenizer_path=args.tokenizer,
+        device=resolve_device(args.device),
+        graph=not args.no_graph,
     )
     for line in check.lines():
         print(f"[INFO] {line}", flush=True)
@@ -267,9 +287,11 @@ def main(argv: list[str] | None = None) -> int:
         "verify",
         help="Compare the served decoder against the single-precision reference on a fixed answer.",
     )
-    verify.add_argument("--model", help="Model file, folder, or name under models/; optional when only one model is there.")
+    verify.add_argument(
+        "--model", help="Model file, folder, or name under models/; optional when only one model is there."
+    )
     verify.add_argument("--tokenizer", help="tokenizer.json; defaults to the file next to the model.")
-    verify.add_argument("--device", default="cpu", help="cpu or cuda.")
+    verify.add_argument("--device", default="auto", help="auto, cpu or cuda.")
     verify.add_argument("--no-graph", action="store_true", help="Check the eager decoder instead of the graphs.")
     verify.set_defaults(handler=_verify)
 

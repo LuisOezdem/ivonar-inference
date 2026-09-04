@@ -105,7 +105,7 @@ class TernaryLinear(nn.Module):
         return dequantize_ternary_codes(codes, self.weight_scales.to(target), self.group_size, dtype)
 
     def materialize(self, dtype: torch.dtype = torch.float32) -> None:
-            self._runtime_weight = self.unpacked_weight(dtype=dtype).detach()
+        self._runtime_weight = self.unpacked_weight(dtype=dtype).detach()
 
     def cached_runtime_weight(self, device: torch.device | str | None = None) -> Tensor | None:
         target = self.packed_weight.device if device is None else torch.device(device)

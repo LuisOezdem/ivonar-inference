@@ -48,22 +48,20 @@ def resolve_model_path(spec: str | Path | None, root: Path | None = None) -> Pat
     """Turn what the user gave into a model file.
 
     ``spec`` may be a model file, a folder holding one, or the name of a
-    subfolder of ``models/``. Without ``spec`` the single model under
-    ``models/`` is used.
+    subfolder of ``models/``. Without ``spec`` the first model under
+    ``models/`` is taken; both the server and the terminal chat can switch to
+    any of the others while they run, so several models are not an error.
     """
 
     base = Path.cwd() if root is None else Path(root)
     if spec is None or str(spec).strip() == "":
         found = available_models(base)
-        if len(found) == 1:
+        if found:
             return found[0]
-        if not found:
-            raise FileNotFoundError(
-                f"no model found; put a release folder with {MODEL_FILE} and {TOKENIZER_FILE} under {base / MODELS_DIR}"
-                " or pass --model"
-            )
-        names = ", ".join(model_name(path, base) for path in found)
-        raise FileNotFoundError(f"several models found, pass --model with one of: {names}")
+        raise FileNotFoundError(
+            f"no model found; put a release folder with {MODEL_FILE} and {TOKENIZER_FILE} under {base / MODELS_DIR}"
+            " or pass --model"
+        )
     path = Path(spec)
     if path.is_file():
         return path

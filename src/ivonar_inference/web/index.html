@@ -81,7 +81,6 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 button, input, textarea, select { font: inherit; color: inherit; }
-/* One scrollbar style for both themes, so a dark page never shows a light one. */
 * { scrollbar-width: thin; scrollbar-color: var(--scroll) transparent; }
 *::-webkit-scrollbar { width: 10px; height: 10px; }
 *::-webkit-scrollbar-track { background: transparent; }
@@ -92,11 +91,9 @@ button { cursor: pointer; border: 0; background: none; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 
 #app { display: grid; grid-template-columns: 268px 1fr; height: 100dvh; overflow: hidden; }
-/* The overlay is taken out of flow so it never becomes a grid column. */
 #scrim { position: fixed; inset: 0; background: rgba(0, 0, 0, .35); z-index: 39; display: none; }
 #scrim.show { display: block; }
 
-/* Sidebar */
 #sidebar {
   display: flex; flex-direction: column; min-width: 0; min-height: 0;
   background: var(--bg-sunken); border-right: 1px solid var(--line);
@@ -155,9 +152,6 @@ textarea.control { resize: vertical; font-family: var(--font); line-height: 1.45
 .meta-line { font-size: 11.5px; color: var(--text-faint); display: flex; justify-content: space-between; gap: 8px; align-items: center; }
 .meta-line span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* Main */
-/* min-height lets the scroller shrink below its content, which is what
-   makes the thread scroll instead of pushing the composer off screen. */
 #main { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
 #topbar {
   display: flex; align-items: center; gap: 10px; padding: 10px 16px;
@@ -255,7 +249,6 @@ textarea.control { resize: vertical; font-family: var(--font); line-height: 1.45
 .bar-fill.warn { background: #e0932f; }
 .bar-fill.full { background: var(--danger); }
 
-/* Dialog */
 dialog {
   border: 1px solid var(--line); border-radius: 12px; padding: 0; background: var(--bg-raised);
   color: var(--text); box-shadow: var(--shadow); width: min(520px, calc(100vw - 32px));
@@ -402,7 +395,7 @@ dialog::backdrop { background: rgba(0, 0, 0, .5); }
 <div id="toast"></div>
 
 <script>
-const RECOMMENDED = { system: "You are a helpful assistant.", temperature: 0.5, top_k: 40, max_tokens: 512, repetition_penalty: 1.15 };
+const RECOMMENDED = { system: "Your name is Ivonar. Give a helpful answer to what the user writes.", temperature: 0.5, top_k: 40, max_tokens: 512, repetition_penalty: 1.15 };
 const STARTERS = [
   "Explain how a car engine works",
   "Write a short poem about the sea",
@@ -416,7 +409,6 @@ const state = {
   streaming: false, controller: null, filter: "", pinned: true,
 };
 
-/* ---------- helpers ---------- */
 const esc = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 function inline(text) {
@@ -474,13 +466,12 @@ async function api(path, options = {}) {
   const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
   if (!response.ok) {
     let detail = response.statusText;
-    try { detail = (await response.json()).detail || detail; } catch (e) { /* keep status text */ }
+    try { detail = (await response.json()).detail || detail; } catch (e) { }
     throw new Error(detail);
   }
   return response.status === 204 ? null : response.json();
 }
 
-/* ---------- status, models, settings ---------- */
 async function loadStatus() {
   state.status = await api("/api/status");
   const s = state.status;
@@ -535,11 +526,9 @@ async function switchModel(name) {
   }
 }
 
-/* ---------- chats ---------- */
 async function refreshList() {
   state.chats = (await api("/api/chats")).chats;
   drawChats();
-  // The first message renames the chat on the server, so the header follows.
   const current = state.chats.find((chat) => chat.id === state.current);
   if (current) $("chat-title").textContent = current.title;
 }
@@ -626,7 +615,6 @@ async function openChat(chatId) {
   closeSidebar();
 }
 
-/* ---------- thread ---------- */
 function stampText(meta) {
   if (!meta) return "";
   return `${meta.completion_tokens} tokens · ${meta.tokens_per_second} tok/s` +
@@ -678,8 +666,6 @@ function pin(smooth) {
   state.pinned = true;
   $("jump").classList.remove("show");
   toBottom(smooth);
-  // Code blocks and wrapped text settle a frame later, so the last line is
-  // only truly in view after the layout is final.
   requestAnimationFrame(() => toBottom(smooth));
   setTimeout(() => toBottom(smooth), 80);
 }
@@ -693,7 +679,6 @@ function updateContextBar(used) {
   $("ctx-label").textContent = `context ${Math.round(share * 100)}%`;
 }
 
-/* ---------- sending ---------- */
 async function send(text) {
   if (state.streaming) return;
   const content = (text !== undefined ? text : $("input").value).trim();
@@ -723,7 +708,7 @@ async function send(text) {
     });
     if (!response.ok) {
       let detail = response.statusText;
-      try { detail = (await response.json()).detail || detail; } catch (e) { /* keep status text */ }
+      try { detail = (await response.json()).detail || detail; } catch (e) { }
       throw new Error(detail);
     }
     const reader = response.body.getReader();
@@ -770,7 +755,6 @@ async function send(text) {
         dropped: finished ? finished.dropped_messages : 0,
       });
     }
-    // The thread already shows this answer, so only the sidebar is refreshed.
     await refreshList();
   }
 }
@@ -794,15 +778,14 @@ async function regenerate() {
   if (last) await send(last);
 }
 
-/* ---------- layout helpers ---------- */
 function autosize() {
   const input = $("input");
   input.style.height = "auto";
+  if (!input.value) return;
   input.style.height = `${Math.min(input.scrollHeight, 220)}px`;
 }
 function closeSidebar() { $("sidebar").classList.remove("open"); $("scrim").classList.remove("show"); }
 
-/* ---------- wiring ---------- */
 $("new-chat").onclick = newChat;
 $("search").oninput = (event) => { state.filter = event.target.value; drawChats(); };
 $("model-select").onchange = (event) => switchModel(event.target.value);
@@ -824,12 +807,13 @@ $("theme-toggle").onclick = () => {
   const order = { system: "light", light: "dark", dark: "system" };
   const next = order[document.documentElement.dataset.theme || "system"];
   document.documentElement.dataset.theme = next;
-  try { localStorage.setItem("ivonar-theme", next); } catch (e) { /* storage may be unavailable */ }
+  try { localStorage.setItem("ivonar-theme", next); } catch (e) { }
   toast(`Theme: ${next}`);
 };
 
 $("send").onclick = () => { if (state.streaming) state.controller && state.controller.abort(); else send(); };
 $("input").addEventListener("input", autosize);
+window.addEventListener("resize", autosize);
 $("input").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); }
 });
@@ -867,14 +851,14 @@ document.addEventListener("keydown", (event) => {
 try {
   const saved = localStorage.getItem("ivonar-theme");
   if (saved) document.documentElement.dataset.theme = saved;
-} catch (e) { /* storage may be unavailable */ }
+} catch (e) { }
 
 (async () => {
   try {
     await loadStatus();
     await loadChats();
   } catch (error) { toast(error.message); }
-  autosize();
+  requestAnimationFrame(autosize);
   $("input").focus();
 })();
 </script>

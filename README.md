@@ -1,6 +1,6 @@
 # Ivonar Inference
 
-Run Ivonar models locally: a terminal chat, an OpenAI-compatible server with a
+Run Ivonar Nano locally: a terminal chat, an OpenAI-compatible server with a
 chat page, and a check that the served model matches its reference.
 
 ## Install
@@ -17,18 +17,26 @@ Put a downloaded release into its own folder under `models/`:
 
 ```
 models/
-  nano/
+  ivonar-nano/
     packed_inference_checkpoint.pt
     tokenizer.json
 ```
 
-That is the whole setup. With one model there it is picked automatically; with
-several, name the folder: `--model nano`. `ivonar models` lists what it finds.
+That is the whole setup. `ivonar models` lists what it finds, the first one is
+loaded, and `--model ivonar-nano` picks another. Both the chat page and the terminal
+switch between installed models while running.
+
+The released model is called Ivonar Nano; where a version is needed it is
+v1.0. The folder name is what the API reports as the model id.
+
+`--device` defaults to `auto`: a CUDA GPU when one is present, otherwise the
+CPU. If the GPU refuses the model, the CPU takes over with a message rather
+than an error.
 
 ## Run
 
 ```bash
-ivonar serve --device cuda
+ivonar serve
 ```
 
 Opens a chat page on `http://127.0.0.1:8000/` with stored conversations,
@@ -36,7 +44,7 @@ search, rename, a model picker, a settings dialog, streaming answers, and
 light and dark themes.
 
 ```bash
-ivonar chat --device cuda
+ivonar chat
 ```
 
 Chats in the terminal. `/help` lists the commands: `/new`, `/system`,
@@ -45,7 +53,7 @@ reports its tokens, speed and context use; when a conversation outgrows the
 context the oldest turns are dropped automatically.
 
 ```bash
-ivonar verify --device cuda
+ivonar verify
 ```
 
 Compares the served decoder against the single-precision reference and prints
@@ -72,14 +80,39 @@ single launch. Switching models releases the previous one.
 
 ## Answer quality
 
-Defaults: temperature 0.5, top-k 40, repetition penalty 1.15, system message
-`You are a helpful assistant.` Two details matter more than they look. Naming
-the model inside its own system message makes it answer about itself instead
-of the question, so the default stays plain; write your own with `--system` or
-in the settings dialog. The repetition penalty also covers the previous
-answer, which keeps a follow-up like "why" from repeating it. Measured over
-five runs of a five-turn conversation, repeated answers fell from 9 of 25 to
-1 of 25.
+Defaults: temperature 0.5, top-k 40, repetition penalty 1.15, and the system
+message `Your name is Ivonar. Give a helpful answer to what the user writes.`
+Set your own with `--system` or in the settings dialog.
+
+It was chosen by search: 83 system messages were screened on a 45-case suite,
+the best 11 ran the full 66-case suite over four seeds, and the last three ran
+six seeds each. Answers were scored on eleven rates, including whether the
+model echoes the question back, leaks its own name into unrelated answers,
+greets normally, states its name when asked, invents a biography, answers
+facts correctly, restates the question instead of answering it, refuses,
+produces a usable task answer, and repeats itself across turns.
+
+| System message | Score | Name leak | Facts |
+|---|---|---|---|
+| `Your name is Ivonar. Give a helpful answer to what the user writes.` | 9.05 | 14% | 0.62 |
+| `Name: Ivonar Answer briefly and correctly.` | 9.17 | 21% | 0.74 |
+| none | 8.53 | 0% | 0.72 |
+
+The second line scores higher and answers worse. Its identity credit came from
+sentences like "Ivonar is a fictional character created by the author of The
+Hunger Games", which contain the name without meaning it, and it opens
+unrelated answers with "Ivonar is a software that ...". The shipped message
+loses a tenth of a point and answers "I'm Ivonar" when asked, greets normally,
+and keeps the name out of everything else.
+
+Two smaller findings: a label followed by a line break makes the model treat
+the label as text to continue, so the parts belong on one line; and a role
+sentence such as "You are a helpful AI assistant" makes it read "can you tell
+me ..." as a question about its abilities and refuse.
+
+What no system message fixes: arithmetic is right about a third of the time,
+facts about two thirds, and the model sometimes invents a biography. Those are
+limits of a 349M model.
 
 ## Test
 

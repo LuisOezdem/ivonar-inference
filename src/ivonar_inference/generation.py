@@ -54,11 +54,11 @@ def stream_text(
         context_tokens += 1
         stable = tokenizer.decode(generated).rstrip("�")
         if stable.startswith(emitted) and len(stable) > len(emitted):
-            yield stable[len(emitted):]
+            yield stable[len(emitted) :]
             emitted = stable
         if token_index + 1 >= max_new_tokens or context_tokens >= max_context:
             break
         next_id = decoder.advance()
     final = tokenizer.decode(generated)
     if final.startswith(emitted) and len(final) > len(emitted):
-        yield final[len(emitted):]
+        yield final[len(emitted) :]

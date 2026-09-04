@@ -24,12 +24,12 @@ def test_single_model_is_found_without_a_spec(tmp_path: Path) -> None:
     assert resolve_model_path(model_file, root=tmp_path) == model_file
 
 
-def test_several_models_need_a_name(tmp_path: Path) -> None:
-    _release(tmp_path, "nano")
+def test_several_models_start_with_the_first_and_stay_switchable(tmp_path: Path) -> None:
+    nano = _release(tmp_path, "nano")
     other = _release(tmp_path, "mini", file_name="mini.pt")
-    with pytest.raises(FileNotFoundError, match="several models"):
-        resolve_model_path(None, root=tmp_path)
-    assert resolve_model_path("mini", root=tmp_path) == other
+    assert available_models(tmp_path) == [other, nano]
+    assert resolve_model_path(None, root=tmp_path) == other
+    assert resolve_model_path("nano", root=tmp_path) == nano
 
 
 def test_missing_models_explain_what_to_do(tmp_path: Path) -> None:
@@ -42,3 +42,16 @@ def test_missing_models_explain_what_to_do(tmp_path: Path) -> None:
     empty.mkdir()
     with pytest.raises(FileNotFoundError, match="holds no model file"):
         resolve_model_path(empty, root=tmp_path)
+
+
+def test_resolve_device_picks_a_gpu_when_there_is_one(monkeypatch) -> None:
+    import torch
+
+    from ivonar_inference.loader import resolve_device
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert resolve_device("auto") == "cuda"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert resolve_device("auto") == "cpu"
+    assert resolve_device("cpu") == "cpu"
+    assert resolve_device("cuda:1") == "cuda:1"

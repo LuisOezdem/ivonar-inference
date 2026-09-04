@@ -39,9 +39,7 @@ def test_complete_returns_the_result_with_text(engine: Engine) -> None:
 
 
 def test_max_tokens_marks_a_cut_answer_as_length(engine: Engine) -> None:
-    result = engine.complete(
-        [{"role": "user", "content": "Where is Paris?"}], GenerationSettings(max_tokens=3)
-    )
+    result = engine.complete([{"role": "user", "content": "Where is Paris?"}], GenerationSettings(max_tokens=3))
     assert result.text == "Paris is the"
     assert result.finish_reason == "length"
 

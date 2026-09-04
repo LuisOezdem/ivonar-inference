@@ -79,7 +79,6 @@ def test_graph_replay_matches_the_one_pass_forward() -> None:
     assert decoder.graph is not None
     check = check_decoder(tiny_model(seed=6), decoder, ids, split=5)
     assert decoder.host_position == 11 - 1
-    # Half-precision weights and caches against the single-precision CPU forward.
     assert check.top1_agreement >= 0.9
     assert check.max_abs_diff < 0.1
 
@@ -94,7 +93,6 @@ def test_device_sampler_applies_top_k_and_the_repetition_penalty() -> None:
     decoder.logits[0, 9] = 5.0
     assert decoder.sample() == 5
     assert bool(decoder.seen[0, 5]) and not bool(decoder.seen[0, 9])
-    # The penalty divides the repeated token's positive score below the runner-up.
     assert decoder.sample() == 9
     decoder.configure_sampling(temperature=1.0, top_k=1, repetition_penalty=1.0)
     assert decoder.sample() == 5
@@ -136,7 +134,9 @@ def test_stream_text_stops_at_a_stop_token(tmp_path: Path, monkeypatch) -> None:
     draws = iter([word_id, word_id, 3, word_id])
     monkeypatch.setattr(decoder, "sample", lambda: next(draws))
     monkeypatch.setattr(decoder, "advance", lambda: next(draws))
-    text = "".join(stream_text(tokenizer, decoder, "hello", max_new_tokens=8, temperature=1.0, top_k=4, stop_token_ids=(3,)))
+    text = "".join(
+        stream_text(tokenizer, decoder, "hello", max_new_tokens=8, temperature=1.0, top_k=4, stop_token_ids=(3,))
+    )
     assert text == "ww"
 
 
@@ -149,7 +149,6 @@ def test_configure_sampling_can_penalize_earlier_words() -> None:
     decoder.logits[0, 9] = 5.0
     decoder.configure_sampling(temperature=1.0, top_k=1, repetition_penalty=1.5)
     assert decoder.sample() == 5
-    # The same logits, but token 5 arrives already penalized from the last answer.
     decoder.configure_sampling(temperature=1.0, top_k=1, repetition_penalty=1.5, penalized_ids=[5, -1, 99999])
     assert decoder.sample() == 9
 

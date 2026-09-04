@@ -14,9 +14,6 @@ ROLE_ASSISTANT = "<|assistant|>"
 TOOL_CALL = "<|tool_call|>"
 THINK_OPEN = "<|think|>"
 THINK_CLOSE = "<|/think|>"
-# Conversation structure is carried by reserved atomic tokens rather than by
-# free text, so a model can never be argued out of its role boundaries by
-# content that merely looks like a role label.
 CHAT_SPECIAL_TOKENS = (
     IM_START,
     IM_END,
@@ -104,12 +101,8 @@ class TernaryTokenizer:
         self.next_id = self.minimum_vocab_size
         self.backend = "python_byte_bpe"
         self._hf_tokenizer: object | None = None
-        # Reserved markers lead the split so they always tokenize atomically.
-        # The punctuation run additionally refuses to start on a marker, so a
-        # marker that follows punctuation cannot be swallowed into that run.
         self._split_re = re.compile(
-            r"<\|/?[a-z_]+\|>|[A-Za-z]+(?:'[A-Za-z]+)?|\d+"
-            r"|(?:(?!<\|/?[a-z_]+\|>)[^\sA-Za-z\d])+|\s+",
+            r"<\|/?[a-z_]+\|>|[A-Za-z]+(?:'[A-Za-z]+)?|\d+" r"|(?:(?!<\|/?[a-z_]+\|>)[^\sA-Za-z\d])+|\s+",
             re.UNICODE,
         )
 

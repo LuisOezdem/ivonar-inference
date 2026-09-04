@@ -89,7 +89,9 @@ class StaticDecoder:
         self.fuse_projections = self.device.type == "cuda" if fuse_projections is None else bool(fuse_projections)
         self.token = torch.zeros(self.batch_size, dtype=torch.int64, device=self.device)
         self.position = torch.zeros(1, dtype=torch.int64, device=self.device)
-        self.logits = torch.zeros(self.batch_size, int(model.config.vocab_size), dtype=torch.float32, device=self.device)
+        self.logits = torch.zeros(
+            self.batch_size, int(model.config.vocab_size), dtype=torch.float32, device=self.device
+        )
         self.slots = torch.arange(self.max_len, device=self.device)
         self.recurrent_states: dict[int, dict[str, Tensor]] = {}
         self.recurrent_complex: dict[int, Tensor] = {}
@@ -152,7 +154,9 @@ class StaticDecoder:
             "double_cdecay": 2.0 * torch.complex(decay, theta).view(1, mixer.num_heads, mixer.state_dim, 1),
             "skip": mixer.skip.to(self.device).view(1, mixer.num_heads, mixer.head_dim),
             "half_dt_min": torch.tensor([0.5 * mixer.dt_min], dtype=torch.float32, device=self.device),
-            "half_dt_range": torch.tensor([0.5 * (mixer.dt_max - mixer.dt_min)], dtype=torch.float32, device=self.device),
+            "half_dt_range": torch.tensor(
+                [0.5 * (mixer.dt_max - mixer.dt_min)], dtype=torch.float32, device=self.device
+            ),
         }
 
     def _prepare_attention(self, index: int, mixer: LatentAttention) -> None:
