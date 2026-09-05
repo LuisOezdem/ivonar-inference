@@ -32,6 +32,15 @@ def test_stream_renders_the_conversation_and_reports_usage(engine: Engine) -> No
     assert result.prompt_tokens == engine.count_tokens(call["prompt"])
 
 
+def test_an_abandoned_stream_releases_the_engine(engine: Engine) -> None:
+    stream = engine.stream([{"role": "user", "content": "Where is Paris?"}])
+    assert next(stream) == "Paris"
+    stream.close()
+    result = engine.complete([{"role": "user", "content": "Where is Paris?"}])
+    assert result.text == ANSWER
+    assert result.finish_reason == "stop"
+
+
 def test_complete_returns_the_result_with_text(engine: Engine) -> None:
     result = engine.complete([{"role": "user", "content": "Where is Paris?"}])
     assert result.text == ANSWER

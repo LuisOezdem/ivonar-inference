@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 
+from .bench import DEFAULT_PROMPT
 from .engine import Engine, GenerationSettings
 from .loader import resolve_device
 from .paths import resolve_model_path
@@ -24,6 +25,11 @@ def _add_model_arguments(parser: argparse.ArgumentParser) -> None:
         "--no-graph",
         action="store_true",
         help="Run the decode step eagerly instead of replaying it as CUDA graphs.",
+    )
+    parser.add_argument(
+        "--no-kernels",
+        action="store_true",
+        help="Use the torch decoder instead of the ternary CUDA kernels.",
     )
     parser.add_argument(
         "--system",
@@ -54,6 +60,7 @@ def _load_engine(model_file: Path, args: argparse.Namespace, device: str) -> tup
             model_id=model_file.parent.name,
             defaults=_settings(args),
             graph=not args.no_graph,
+            kernels=not args.no_kernels,
         )
     except (torch.cuda.OutOfMemoryError, torch.AcceleratorError, OSError) as exc:
         if device == "cpu":
@@ -73,6 +80,7 @@ def _registry(args: argparse.Namespace) -> ModelRegistry:
         graph=not args.no_graph,
         defaults=engine.defaults,
         system=args.system,
+        kernels=not args.no_kernels,
     )
     _report(registry)
     return registry
@@ -82,9 +90,11 @@ def _report(registry: ModelRegistry) -> None:
     info = registry.engine.info
     print(
         f"[INFO] {registry.current}: stage={info.stage} step={info.step} context={info.context_tokens} "
-        f"device={info.device} graph={info.graph}",
+        f"device={info.device} backend={info.backend} graph={info.graph}",
         flush=True,
     )
+    for note in info.notes:
+        print(f"[WARN] {note}", flush=True)
     others = [entry.name for entry in registry.entries() if not entry.loaded]
     if others:
         print(f"[INFO] also installed: {', '.join(others)} (switch with /model, or in the app)", flush=True)
@@ -230,7 +240,8 @@ def _chat(args: argparse.Namespace) -> int:
         note = f" dropped_turns={result.dropped_messages}" if result.dropped_messages else ""
         print(
             f"\n[INFO] tokens={result.completion_tokens} seconds={result.seconds:.2f} "
-            f"tokens_per_s={result.tokens_per_second:.1f} context={used}/{engine.info.context_tokens}{note}",
+            f"first_token_ms={result.first_token_seconds * 1000:.0f} decode_tokens_per_s={result.decode_tokens_per_second:.0f} "
+            f"tokens_per_s={result.tokens_per_second:.0f} context={used}/{engine.info.context_tokens}{note}",
             flush=True,
         )
 
@@ -243,10 +254,21 @@ def _verify(args: argparse.Namespace) -> int:
         tokenizer_path=args.tokenizer,
         device=resolve_device(args.device),
         graph=not args.no_graph,
+        kernels=not args.no_kernels,
     )
     for line in check.lines():
         print(f"[INFO] {line}", flush=True)
     return 0 if check.passed else 1
+
+
+def _bench(args: argparse.Namespace) -> int:
+    from .bench import run_benchmark
+
+    registry = _registry(args)
+    result = run_benchmark(registry.engine, prompt=args.prompt, tokens=args.tokens, system=registry.system or None)
+    for line in result.lines():
+        print(f"[INFO] {line}", flush=True)
+    return 0
 
 
 def _models(args: argparse.Namespace) -> int:
@@ -293,7 +315,14 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("--tokenizer", help="tokenizer.json; defaults to the file next to the model.")
     verify.add_argument("--device", default="auto", help="auto, cpu or cuda.")
     verify.add_argument("--no-graph", action="store_true", help="Check the eager decoder instead of the graphs.")
+    verify.add_argument("--no-kernels", action="store_true", help="Check the torch decoder instead of the ternary kernels.")
     verify.set_defaults(handler=_verify)
+
+    bench = commands.add_parser("bench", help="Measure prefill and decode speed of the served decoder.")
+    _add_model_arguments(bench)
+    bench.add_argument("--tokens", type=int, default=256, help="Decode steps to time.")
+    bench.add_argument("--prompt", default=DEFAULT_PROMPT, help="Prompt to time.")
+    bench.set_defaults(handler=_bench)
 
     args = parser.parse_args(argv)
     try:

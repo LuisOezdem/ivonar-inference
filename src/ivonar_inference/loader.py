@@ -159,8 +159,14 @@ def load_model(
     path: str | Path,
     device: str | torch.device = "cpu",
     expected_tokenizer_sha256: str | None = None,
+    materialize: bool = True,
 ) -> LoadedModel:
-    """Load an Ivonar model file and prepare it for decoding on ``device``."""
+    """Load an Ivonar model file and prepare it for decoding on ``device``.
+
+    ``materialize`` unpacks the ternary weights into full-precision matrices
+    for the torch code path; the ternary kernels read the packed weights and
+    skip it.
+    """
 
     model_file = Path(path)
     payload = torch.load(model_file, map_location="cpu", weights_only=True)
@@ -184,7 +190,8 @@ def load_model(
     target = torch.device(device)
     model.to(target)
     model.eval()
-    materialize_weights(model, torch.float16 if target.type == "cuda" else torch.float32)
+    if materialize:
+        materialize_weights(model, torch.float16 if target.type == "cuda" else torch.float32)
     return LoadedModel(
         model=model,
         config=config,

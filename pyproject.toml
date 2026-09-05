@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ivonar-inference"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local inference server and CLI for Ivonar ternary language models."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -30,7 +30,7 @@ ivonar = "ivonar_inference.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ivonar_inference = ["web/*.html", "web/assets/*"]
+ivonar_inference = ["web/*.html", "web/assets/*", "kernels/*.cu"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

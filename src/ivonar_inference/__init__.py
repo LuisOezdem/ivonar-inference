@@ -7,7 +7,7 @@ from .registry import DEFAULT_SYSTEM, ModelRegistry
 from .server import create_app
 from .tokenizer import TernaryTokenizer, format_chat_messages
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 DEFAULT_MODEL_ID = "ivonar-nano"
 
 __all__ = [

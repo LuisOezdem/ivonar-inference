@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
 
-from .decoder import StaticDecoder
+from .decoder import StaticDecoder, build_decoder
 from .loader import load_model
 from .model import IvonarModel
 from .tokenizer import TernaryTokenizer, format_chat_messages, tokenizer_file_sha256
@@ -29,13 +29,14 @@ class DecoderCheck:
     top1_agreement: float
     reference_log_prob: float
     decoder_log_prob: float
+    backend: str = ""
 
     @property
     def passed(self) -> bool:
         return self.top1_agreement >= 0.9 and abs(self.decoder_log_prob - self.reference_log_prob) <= 0.1
 
     def lines(self) -> list[str]:
-        return [
+        return ([f"decoder: {self.backend}"] if self.backend else []) + [
             f"positions compared: {self.positions}",
             f"max |logit diff|: {self.max_abs_diff:.4f}, mean: {self.mean_abs_diff:.5f}",
             f"top-1 agreement: {self.top1_agreement:.3f}",
@@ -82,6 +83,7 @@ def verify_model(
     tokenizer_path: str | Path | None = None,
     device: str = "cpu",
     graph: bool = True,
+    kernels: bool = True,
     question: str = DEFAULT_QUESTION,
     answer: str = DEFAULT_ANSWER,
 ) -> DecoderCheck:
@@ -95,8 +97,10 @@ def verify_model(
     prompt_ids = tokenizer.encode(prompt)
     ids = prompt_ids + tokenizer.encode(answer)
     reference = load_model(model_file, device="cpu", expected_tokenizer_sha256=expected).model
-    served = load_model(model_file, device=device, expected_tokenizer_sha256=expected).model
-    decoder = StaticDecoder(served, device=device)
-    if graph and torch.device(device).type == "cuda":
-        decoder.capture()
-    return check_decoder(reference, decoder, ids, len(prompt_ids))
+    on_gpu = torch.device(device).type == "cuda"
+    served = load_model(model_file, device=device, expected_tokenizer_sha256=expected, materialize=not (kernels and on_gpu)).model
+    decoder, backend, _ = build_decoder(served, device, kernels=kernels)
+    captured = graph and torch.device(device).type == "cuda" and decoder.capture()
+    label = f"{backend} kernels" if backend == "ternary" else "torch"
+    label += ", CUDA graph" if captured else ", eager"
+    return replace(check_decoder(reference, decoder, ids, len(prompt_ids)), backend=label)

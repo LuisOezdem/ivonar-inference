@@ -149,8 +149,9 @@ select.control, input.control, textarea.control {
   border: 1px solid var(--line); background: var(--bg-raised); font-size: 13px;
 }
 textarea.control { resize: vertical; font-family: var(--font); line-height: 1.45; }
-.meta-line { font-size: 11.5px; color: var(--text-faint); display: flex; justify-content: space-between; gap: 8px; align-items: center; }
-.meta-line span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meta-line { font-size: 11.5px; color: var(--text-faint); display: flex; justify-content: space-between; gap: 8px; align-items: center; min-width: 0; }
+.meta-line span { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meta-line .btn { flex: none; }
 
 #main { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg); }
 #topbar {
@@ -475,8 +476,10 @@ async function api(path, options = {}) {
 async function loadStatus() {
   state.status = await api("/api/status");
   const s = state.status;
-  $("model-pill").innerHTML = `<b>${esc(s.model)}</b> · ${esc(s.device)}${s.graph ? " · graph" : ""}`;
-  $("device-line").textContent = `${s.device}${s.graph ? " · graph" : ""} · ${s.context_tokens} ctx`;
+  const backend = s.backend === "ternary" ? " · ternary kernels" : "";
+  $("model-pill").innerHTML = `<b>${esc(s.model)}</b> · ${esc(s.device)}${backend}${s.graph ? " · graph" : ""}`;
+  $("device-line").textContent = `${s.device}${s.backend === "ternary" ? " · ternary" : ""}${s.graph ? " · graph" : ""} · ${s.context_tokens} ctx`;
+  $("device-line").title = `${s.device}${backend}${s.graph ? " · CUDA graph" : ""} · ${s.context_tokens} context tokens`;
   $("brand-sub").textContent = s.model;
   const select = $("model-select");
   select.innerHTML = "";
@@ -617,7 +620,10 @@ async function openChat(chatId) {
 
 function stampText(meta) {
   if (!meta) return "";
-  return `${meta.completion_tokens} tokens · ${meta.tokens_per_second} tok/s` +
+  const detail = meta.first_token_seconds !== undefined
+    ? ` · first token ${Math.round(meta.first_token_seconds * 1000)} ms · ${Math.round(meta.decode_tokens_per_second)} tok/s decoding`
+    : "";
+  return `${meta.completion_tokens} tokens · ${Math.round(meta.tokens_per_second)} tok/s overall${detail}` +
     (meta.finish_reason === "length" ? " · answer limit reached" : "");
 }
 
@@ -733,7 +739,7 @@ async function send(text) {
           target.innerHTML = render(answer);
           node.querySelector(".body").insertAdjacentHTML("beforeend", `<div class="stamp">${esc(stampText(payload))}</div>`);
           $("speed-pill").hidden = false;
-          $("speed-pill").innerHTML = `<b>${payload.tokens_per_second}</b> tok/s`;
+          $("speed-pill").innerHTML = `<b>${Math.round(payload.decode_tokens_per_second)}</b> tok/s · first token ${Math.round(payload.first_token_seconds * 1000)} ms`;
           updateContextBar(payload.prompt_tokens + payload.completion_tokens);
           if (payload.dropped_messages) {
             $("thread").insertAdjacentHTML("beforeend", `<div class="divider">Earlier turns dropped to free context (${payload.dropped_messages})</div>`);

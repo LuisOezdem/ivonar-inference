@@ -1,7 +1,8 @@
 # Ivonar Inference
 
 Run Ivonar Nano locally: a terminal chat, an OpenAI-compatible server with a
-chat page, and a check that the served model matches its reference.
+chat page, ternary CUDA kernels that read the 2-bit weights as they are stored,
+and a check that the served model matches its reference.
 
 ## Install
 
@@ -9,7 +10,8 @@ chat page, and a check that the served model matches its reference.
 pip install .
 ```
 
-Python 3.12 or newer. A CUDA build of PyTorch is needed for GPU decoding.
+Python 3.12 or newer. A CUDA build of PyTorch is needed for GPU decoding; the
+kernels compile themselves on first start, no CUDA toolkit is required.
 
 ## Add a model
 
@@ -45,34 +47,71 @@ ivonar chat
 ```
 
 Chats in the terminal. `/help` lists the commands: `/new`, `/system`, `/model`,
-`/models`, `/set temperature=0.7`, `/stats`, `/exit`. Every answer reports its
-tokens, speed and context use; when a conversation outgrows the context the
-oldest turns are dropped automatically.
+`/models`, `/set temperature=0.7`, `/stats`, `/exit`. When a conversation
+outgrows the context the oldest turns are dropped automatically.
 
 ```bash
+ivonar bench
 ivonar verify
 ```
 
-Compares the served decoder against the single-precision reference.
+`bench` times the prompt prefill, the decode step and a full answer. `verify`
+compares the served decoder against the single-precision reference.
 
 ## API
 
 `POST /v1/chat/completions` follows the OpenAI protocol, including `stream` and
 `stop`. `GET /v1/models` lists the models, and naming one in a request switches
 to it. `GET /api/status`, `POST /api/settings` and `POST /api/model` read and
-change the running configuration; the chat page's own conversation endpoints
-live under `/api/chats`.
+change the running configuration; the chat page's conversation endpoints live
+under `/api/chats`. A client that stops reading a stream early never blocks the
+next request.
+
+## Ternary kernels
+
+On a GPU the decode step runs through CUDA kernels written for the ternary
+format. Every weight matrix stays packed, four ternary values per byte with one
+float16 scale per 128 inputs, activations are quantized to int8 per token inside
+the kernel, dot products run on `dp4a`, and results accumulate in fp32, so the
+arithmetic follows the reference model's own quantization rule.
+
+One token is a single CUDA graph of 129 launches: fused normalize, quantize and
+matrix-vector kernels, one kernel for the Mamba recurrence, one for latent
+attention, a fused top-k sampler, and the output head pinned in the persisting
+part of the L2 cache. Prompts run through the same kernels in 32-token tiles,
+so no fp16 weight copies exist; Ivonar Nano occupies about 275 MiB of GPU
+memory.
+
+The kernels compile with NVRTC from the torch installation the first time a
+model loads and are cached in `~/.ivonar/kernels`. Where they cannot be built
+the engine falls back to the torch decoder and says so in the status line.
+`--no-kernels` forces the torch decoder, `--no-graph` runs either decoder
+eagerly.
 
 ## Speed
 
-| Setup | Typical |
-|---|---|
-| GPU, CUDA graph decoder (default) | 170 to 190 tokens per second on an RTX 4060 Ti |
-| GPU, `--no-graph` | 15 to 20 tokens per second |
-| CPU | 8 to 12 tokens per second |
+Measured on an RTX 4060 Ti with Ivonar Nano, 4096-token context.
 
-The decode step is recorded as CUDA graphs at load time, so a token costs a
-single launch. Switching models releases the previous one.
+| Setup | Decode | Notes |
+|---|---|---|
+| Ternary kernels, CUDA graph (default) | 1100 to 1150 tokens per second | 36-token prompt in 9 ms, 465 tokens in 68 ms |
+| Ternary kernels, `--no-graph` | about 230 tokens per second | |
+| Torch decoder, `--no-kernels` | 170 to 190 tokens per second | fp16 weights, 1.3 GB of GPU memory |
+| CPU | 8 to 12 tokens per second | |
+
+A 36-token prompt with a 256-token answer runs end to end at about 1000 tokens
+per second. `ivonar verify` reports the same agreement with the reference for
+both decoders: top-1 agreement above 0.95 and a mean logit difference of 0.047,
+the noise floor of the model's own int8 activation quantization.
+
+Every answer reports its time to the first token and its decoding speed
+separately, in the terminal, on the chat page and in the chats API. The two
+differ after a pause: Windows parks an idle GeForce in its lowest power state
+after roughly ten seconds, and it takes a few hundred milliseconds of work to
+return to full clocks, so a short answer typed after a break runs at a third of
+the speed. To keep the clocks up while the server runs, set the NVIDIA Control
+Panel power management mode to "Prefer maximum performance" for `python.exe`;
+it costs idle power, which is why the program does not do it for you.
 
 ## Defaults
 
@@ -92,7 +131,9 @@ pip install -e ".[test]"
 pytest
 ```
 
-The tests build tiny models in memory and need no model file.
+The tests build tiny models in memory and need no model file. The kernel tests
+run when a GPU is present and compare every kernel path against the
+single-precision forward.
 
 ## Licence
 

@@ -5,10 +5,11 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from queue import SimpleQueue
 
 import torch
 
-from .decoder import StaticDecoder
+from .decoder import StaticDecoder, build_decoder
 from .generation import stream_text
 from .loader import load_model
 from .tokenizer import IM_END, TernaryTokenizer, format_chat_messages, tokenizer_file_sha256
@@ -53,6 +54,8 @@ class ModelInfo:
     phase: str | None = None
     step: int = 0
     graph: bool = False
+    backend: str = "torch"
+    notes: tuple[str, ...] = ()
 
 
 @dataclass
@@ -63,10 +66,18 @@ class GenerationResult:
     seconds: float = 0.0
     text: str = ""
     dropped_messages: int = 0
+    first_token_seconds: float = 0.0
 
     @property
     def tokens_per_second(self) -> float:
         return self.completion_tokens / self.seconds if self.seconds > 0 else 0.0
+
+    @property
+    def decode_tokens_per_second(self) -> float:
+        remaining = self.seconds - self.first_token_seconds
+        if self.completion_tokens > 1 and remaining > 0:
+            return (self.completion_tokens - 1) / remaining
+        return self.tokens_per_second
 
 
 class Engine:
@@ -98,13 +109,14 @@ class Engine:
         model_id: str = "ivonar-nano",
         defaults: GenerationSettings | None = None,
         graph: bool = True,
+        kernels: bool = True,
     ) -> Engine:
         """Load a model file and its tokenizer.
 
         ``tokenizer_path`` defaults to the ``tokenizer.json`` next to the model.
-        Decoding always runs through the static decoder; ``graph`` records its
-        step as CUDA graphs on a GPU, which removes the per-token launch
-        overhead.
+        On a GPU the decode step runs through the ternary CUDA kernels unless
+        ``kernels`` is off, and ``graph`` records it as a CUDA graph, which
+        removes the per-token launch overhead.
         """
 
         model_file = Path(model_path)
@@ -114,7 +126,12 @@ class Engine:
         if not tokenizer_file.is_file():
             raise FileNotFoundError(f"tokenizer file does not exist: {tokenizer_file}")
         tokenizer = TernaryTokenizer.load(tokenizer_file)
-        loaded = load_model(model_file, device=device, expected_tokenizer_sha256=tokenizer_file_sha256(tokenizer_file))
+        loaded = load_model(
+            model_file,
+            device=device,
+            expected_tokenizer_sha256=tokenizer_file_sha256(tokenizer_file),
+            materialize=not (kernels and torch.device(device).type == "cuda"),
+        )
         if len(tokenizer) != loaded.config.vocab_size:
             raise RuntimeError(
                 f"tokenizer vocabulary {len(tokenizer)} does not match the model vocabulary {loaded.config.vocab_size}"
@@ -130,9 +147,10 @@ class Engine:
             step=loaded.step,
         )
         engine = cls(loaded.model, tokenizer, info, defaults)
-        engine.decoder = StaticDecoder(loaded.model, device=device, sampling=True)
-        if graph and torch.device(device).type == "cuda" and engine.decoder.capture():
-            engine.info = replace(info, graph=True)
+        decoder, backend, note = build_decoder(loaded.model, device, sampling=True, kernels=kernels)
+        engine.decoder = decoder
+        captured = bool(graph and torch.device(device).type == "cuda" and decoder.capture())
+        engine.info = replace(info, graph=captured, backend=backend, notes=(note,) if note else ())
         return engine
 
     def count_tokens(self, text: str) -> int:
@@ -175,41 +193,75 @@ class Engine:
         return prompt, prompt_tokens
 
     def stream(self, messages: Sequence[Message], settings: GenerationSettings | None = None) -> Iterator[str]:
-        """Yield answer text as it is generated; one generation runs at a time."""
+        """Yield answer text as it is generated; one generation runs at a time.
+
+        The decoder runs in a worker thread that holds the engine lock until
+        the answer ends, so a consumer that stops reading early cannot leave
+        the model locked; it only makes the worker stop at the next token.
+        """
 
         active = (settings or self.defaults).validated(self.info.context_tokens)
         kept, prompt, prompt_tokens, dropped = self.fit_messages(messages, active)
         stop_ids = (int(self.tokenizer.special_tokens[IM_END]),)
         previous = next((m["content"] for m in reversed(kept) if m.get("role") == "assistant"), "")
-        with self._lock:
-            result = GenerationResult(prompt_tokens=prompt_tokens, dropped_messages=dropped)
-            started = time.perf_counter()
-            pieces: list[str] = []
-            for delta in _cut_at_stop_strings(
-                self._stream_fn(
-                    tokenizer=self.tokenizer,
-                    decoder=self.decoder,
-                    prompt=prompt,
-                    max_new_tokens=active.max_tokens,
-                    temperature=active.temperature,
-                    top_k=active.top_k,
-                    repetition_penalty=active.repetition_penalty,
-                    stop_token_ids=stop_ids,
-                    penalized_text=previous[:2000],
-                ),
-                active.stop,
-            ):
-                pieces.append(delta)
-                yield delta
-            result.seconds = time.perf_counter() - started
-            result.text = "".join(pieces)
-            result.completion_tokens = self.count_tokens(result.text)
-            result.finish_reason = "length" if result.completion_tokens >= active.max_tokens else "stop"
-            self.last_generation = result
+        queue: SimpleQueue[object] = SimpleQueue()
+        abandoned = threading.Event()
+
+        def produce() -> None:
+            try:
+                with self._lock:
+                    result = GenerationResult(prompt_tokens=prompt_tokens, dropped_messages=dropped)
+                    started = time.perf_counter()
+                    pieces: list[str] = []
+                    for delta in _cut_at_stop_strings(
+                        self._stream_fn(
+                            tokenizer=self.tokenizer,
+                            decoder=self.decoder,
+                            prompt=prompt,
+                            max_new_tokens=active.max_tokens,
+                            temperature=active.temperature,
+                            top_k=active.top_k,
+                            repetition_penalty=active.repetition_penalty,
+                            stop_token_ids=stop_ids,
+                            penalized_text=previous[:2000],
+                        ),
+                        active.stop,
+                    ):
+                        if abandoned.is_set():
+                            break
+                        if not pieces:
+                            result.first_token_seconds = time.perf_counter() - started
+                        pieces.append(delta)
+                        queue.put(delta)
+                    result.seconds = time.perf_counter() - started
+                    result.text = "".join(pieces)
+                    result.completion_tokens = self.count_tokens(result.text)
+                    result.finish_reason = "length" if result.completion_tokens >= active.max_tokens else "stop"
+                    self.last_generation = result
+            except BaseException as exc:
+                queue.put(exc)
+                return
+            queue.put(_END_OF_STREAM)
+
+        worker = threading.Thread(target=produce, name="ivonar-generation", daemon=True)
+        worker.start()
+        try:
+            while True:
+                item = queue.get()
+                if item is _END_OF_STREAM:
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            abandoned.set()
 
     def complete(self, messages: Sequence[Message], settings: GenerationSettings | None = None) -> GenerationResult:
         text = "".join(self.stream(messages, settings))
         return replace(self.last_generation, text=text)
+
+
+_END_OF_STREAM = object()
 
 
 def _cut_at_stop_strings(deltas: Iterator[str], stop: Sequence[str]) -> Iterator[str]:

@@ -107,6 +107,7 @@ def create_app(
             "status": "ok",
             "model": info.model_id,
             "device": info.device,
+            "backend": info.backend,
             "graph": info.graph,
             "context_tokens": info.context_tokens,
             "system": state["system"],
@@ -284,5 +285,7 @@ def _stream_turn(engine: Engine, store: ChatStore, chat_id: str, messages, setti
             "dropped_messages": result.dropped_messages,
             "seconds": round(result.seconds, 2),
             "tokens_per_second": round(result.tokens_per_second, 1),
+            "first_token_seconds": round(result.first_token_seconds, 3),
+            "decode_tokens_per_second": round(result.decode_tokens_per_second, 1),
         }
     )

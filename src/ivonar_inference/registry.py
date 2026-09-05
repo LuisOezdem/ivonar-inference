@@ -38,10 +38,12 @@ class ModelRegistry:
         graph: bool = True,
         defaults: GenerationSettings | None = None,
         system: str | None = None,
+        kernels: bool = True,
     ) -> None:
         self.root = Path.cwd() if root is None else Path(root)
         self.device = device
         self.graph = graph
+        self.kernels = kernels
         self.defaults = defaults or current.defaults
         self.system = DEFAULT_SYSTEM if system is None else system
         self._engine = current
@@ -80,6 +82,7 @@ class ModelRegistry:
                 model_id=self._name_of(target),
                 defaults=self.defaults,
                 graph=self.graph,
+                kernels=self.kernels,
             )
             self._engine = engine
             self._path = target

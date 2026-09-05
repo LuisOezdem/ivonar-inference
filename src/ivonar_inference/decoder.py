@@ -395,6 +395,7 @@ class StaticDecoder:
         saved_token = self.token.clone()
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
+        self._prepare_stream(stream)
         graphs: dict[int, torch.cuda.CUDAGraph] = {}
         try:
             for length in self.attention_lengths:
@@ -418,6 +419,9 @@ class StaticDecoder:
         self.token.copy_(saved_token)
         return True
 
+    def _prepare_stream(self, stream: torch.cuda.Stream) -> None:
+        return None
+
     @torch.no_grad()
     def step(self, token: Tensor) -> Tensor:
         """Feed one token per batch row and return the next logits."""
@@ -434,3 +438,41 @@ class StaticDecoder:
         self.position.zero_()
         self.host_position = 0
         self.seen.zero_()
+
+
+def _ensure_torch_weights(model: IvonarModel, device: torch.device) -> None:
+    from .loader import materialize_weights
+
+    missing = any(
+        module.cached_runtime_weight(device) is None for module in model.modules() if isinstance(module, TernaryLinear)
+    )
+    if missing:
+        materialize_weights(model, torch.float16 if device.type == "cuda" else torch.float32)
+
+
+def build_decoder(
+    model: IvonarModel,
+    device: str | torch.device,
+    sampling: bool = False,
+    max_top_k: int = 256,
+    kernels: bool = True,
+) -> tuple[StaticDecoder, str, str | None]:
+    """The decoder the engine serves: ternary CUDA kernels where they compile, the torch step otherwise."""
+
+    target = torch.device(device)
+    if kernels and target.type == "cuda":
+        from .kernel_decoder import KernelDecoder
+        from .kernels.runtime import KernelError
+
+        try:
+            decoder = KernelDecoder(model, device=target, sampling=sampling, max_top_k=max_top_k)
+        except (KernelError, OSError, RuntimeError) as exc:
+            _ensure_torch_weights(model, target)
+            note = f"ternary kernels unavailable, using the torch decoder: {exc}"
+            return StaticDecoder(model, device=target, sampling=sampling, max_top_k=max_top_k), "torch", note
+        if decoder.tile_prefill:
+            return decoder, "ternary", None
+        _ensure_torch_weights(model, target)
+        return decoder, "ternary", "tile prefill does not support this model shape, prompts run through the torch path"
+    _ensure_torch_weights(model, target)
+    return StaticDecoder(model, device=target, sampling=sampling, max_top_k=max_top_k), "torch", None
