@@ -80,7 +80,8 @@ matrix-vector kernels, one kernel for the Mamba recurrence, one for latent
 attention, a fused top-k sampler, and the output head pinned in the persisting
 part of the L2 cache. Prompts run through the same kernels in 32-token tiles,
 so no fp16 weight copies exist; Ivonar Nano occupies about 275 MiB of GPU
-memory.
+memory. The tiles win up to a few hundred prompt tokens; past roughly a
+thousand the torch prefill is faster.
 
 The kernels compile with NVRTC from the torch installation the first time a
 model loads and are cached in `~/.ivonar/kernels`. Where they cannot be built
@@ -94,9 +95,9 @@ Measured on an RTX 4060 Ti with Ivonar Nano, 4096-token context.
 
 | Setup | Decode | Notes |
 |---|---|---|
-| Ternary kernels, CUDA graph (default) | 1100 to 1150 tokens per second | 36-token prompt in 9 ms, 465 tokens in 68 ms |
-| Ternary kernels, `--no-graph` | about 230 tokens per second | |
-| Torch decoder, `--no-kernels` | 170 to 190 tokens per second | fp16 weights, 1.3 GB of GPU memory |
+| Ternary kernels, CUDA graph (default) | 1,078 tokens per second | 36-token prompt in 9 ms, 465 tokens in 68 ms, 275 MiB of GPU memory |
+| Ternary kernels, `--no-graph` | about 850 tokens per second | one launch per kernel from Python |
+| Torch decoder, `--no-kernels` | 187 tokens per second | fp16 weights, 1.3 GB of GPU memory |
 | CPU | 8 to 12 tokens per second | |
 
 A 36-token prompt with a 256-token answer runs end to end at about 1000 tokens
