@@ -4,6 +4,9 @@ Run Ivonar Nano locally: a terminal chat, an OpenAI-compatible server with a
 chat page, ternary CUDA kernels that read the 2-bit weights as they are stored,
 and a check that the served model matches its reference.
 
+Model: [huggingface.co/Ivonar/ivonar-nano](https://huggingface.co/Ivonar/ivonar-nano) ·
+Project: [ivonar.com](https://ivonar.com/)
+
 ## Install
 
 ```bash
@@ -15,7 +18,9 @@ kernels compile themselves on first start, no CUDA toolkit is required.
 
 ## Add a model
 
-Put a downloaded release into its own folder under `models/`:
+Download the release from
+[huggingface.co/Ivonar/ivonar-nano](https://huggingface.co/Ivonar/ivonar-nano) and put it into
+its own folder under `models/`:
 
 ```
 models/
