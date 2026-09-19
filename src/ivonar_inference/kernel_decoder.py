@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from ctypes import c_int, c_void_p
 from importlib import resources
 
 import torch
@@ -35,6 +36,7 @@ TILE_STATE = 16
 TILE_HEAD = 128
 TILE_TAPS = 8
 SELF_CHECK_TOLERANCE = 0.25
+BURST = 16
 
 
 def kernel_source() -> str:
@@ -170,6 +172,8 @@ class KernelDecoder(StaticDecoder):
         self.splits = int(splits)
         self._launches: list[Launch] = []
         self._rope_tables: dict[int, Tensor] = {}
+        self._prefetch_slots: dict[int, tuple[c_void_p, c_int]] = {}
+        self._launch_matrices: dict[int, Matrix] = {}
         self._build()
 
     def _build(self) -> None:
@@ -211,8 +215,14 @@ class KernelDecoder(StaticDecoder):
         defines = {"HEAD_DIM": head_dim, "MAX_CHUNKS": max_chunks, "MAX_TOPK": max_top_k, "TILE": TILE}
         self._module = runtime.compile_module(kernel_source(), defines, device)
         self._sample_launches: list[Launch] = []
+        self._burst_launches: list[list[Launch]] = []
+        self._burst_graph: torch.cuda.CUDAGraph | None = None
+        self.history = torch.zeros(BURST, dtype=torch.int64, device=device)
         if self.sampling and self.max_top_k <= SAMPLE_THREADS:
-            self._sample_launches = self._sampler(int(config.vocab_size))
+            vocab = int(config.vocab_size)
+            self.bounds = torch.zeros((vocab + BOUND_GROUP - 1) // BOUND_GROUP, dtype=torch.float32, device=device)
+            self._sample_launches = self._sampler(vocab)
+            self._burst_launches = [self._sampler(vocab, self.history[slot : slot + 1]) for slot in range(BURST)]
         capacity = runtime.driver().persisting_capacity(int(device.index))
         self.arena = Arena(capacity, device) if capacity > 0 else None
         self._persisted_stream: int | None = None
@@ -257,6 +267,7 @@ class KernelDecoder(StaticDecoder):
             self._gemv("gemv_prequant_store", self._token_matrix, None, None, self.logits, prequant=True),
         ]
         self._launches.extend(self._head_launches)
+        self._link_prefetch()
         self._persisting = arena is not None and arena.used > 0
         if self._persisting:
             try:
@@ -470,6 +481,9 @@ class KernelDecoder(StaticDecoder):
     @torch.no_grad()
     def capture(self, warmup_steps: int = 2) -> bool:
         captured = super().capture(warmup_steps)
+        if captured and self.sampling:
+            self._burst_graph = self._capture_burst(warmup_steps)
+            self.burst_size = BURST if self._burst_graph is not None else 1
         if not captured or self._tile_launches is None:
             return captured
         saved_position = int(self.position)
@@ -565,7 +579,34 @@ class KernelDecoder(StaticDecoder):
         ]
         if matrix.wide and not prequant:
             name += "_wide"
-        return Launch(self._module.kernel(name), (matrix.grid, 1, 1), (THREADS, 1, 1), args)
+        launch = self._prefetching(name, (matrix.grid, 1, 1), (THREADS, 1, 1), args)
+        self._launch_matrices[id(launch)] = matrix
+        return launch
+
+    def _prefetching(
+        self, name: str, grid: tuple[int, int, int], block: tuple[int, int, int], args: list[object]
+    ) -> Launch:
+        slot = (c_void_p(0), c_int(0))
+        launch = Launch(self._module.kernel(name), grid, block, [*args, *slot])
+        self._prefetch_slots[id(launch)] = slot
+        return launch
+
+    def _link_prefetch(self) -> None:
+        """Point every launch at the weights of the next matrix, which it asks L2 to fetch while it runs."""
+
+        upcoming: Matrix | None = None
+        for launch in reversed(self._launches):
+            slot = self._prefetch_slots.get(id(launch))
+            if slot is not None and upcoming is not None and not self._pinned(upcoming):
+                slot[0].value = upcoming.packed.data_ptr()
+                slot[1].value = upcoming.packed.numel()
+            upcoming = self._launch_matrices.get(id(launch), upcoming)
+
+    def _pinned(self, matrix: Matrix) -> bool:
+        arena = self.arena
+        if arena is None or arena.used == 0:
+            return False
+        return arena.base <= matrix.packed.data_ptr() < arena.base + arena.used
 
     def _quantize(self, name: str, source: Tensor, aux: Tensor | None, width: int, eps: float = 1e-6) -> Launch:
         args = [
@@ -576,9 +617,8 @@ class KernelDecoder(StaticDecoder):
             name += "_wide"
         return Launch(self._module.kernel(name), (1, 1, 1), (THREADS, 1, 1), args)
 
-    def _sampler(self, vocab: int) -> list[Launch]:
+    def _sampler(self, vocab: int, history: Tensor | None = None) -> list[Launch]:
         groups = (vocab + BOUND_GROUP - 1) // BOUND_GROUP
-        self.bounds = torch.zeros(groups, dtype=torch.float32, device=self.device)
         bounds_args = [
             pointer(self.logits), pointer(self.temperature), pointer(self.penalty), pointer(self.inverse_penalty),
             pointer(self.seen), pointer(self.bounds), int32(vocab),
@@ -586,7 +626,7 @@ class KernelDecoder(StaticDecoder):
         sample_args = [
             pointer(self.logits), pointer(self.bounds), pointer(self.temperature), pointer(self.penalty),
             pointer(self.inverse_penalty), pointer(self.seen), pointer(self.top_k), pointer(self.uniform),
-            pointer(self.token), int32(vocab),
+            pointer(self.token), pointer(history), int32(vocab),
         ]
         return [
             Launch(self._module.kernel("logit_bounds"), (groups, 1, 1), (BOUND_GROUP, 1, 1), bounds_args),
@@ -612,11 +652,8 @@ class KernelDecoder(StaticDecoder):
             int32(mixer.conv_kernel_size), float32(0.5 * mixer.dt_min), float32(0.5 * (mixer.dt_max - mixer.dt_min)),
             int32(dims),
         ]
-        return Launch(
-            self._module.kernel("recurrent_step"),
-            (mixer.num_heads, mixer.head_dim // dims, 1),
-            (mixer.state_dim * dims, 1, 1),
-            args,
+        return self._prefetching(
+            "recurrent_step", (mixer.num_heads, mixer.head_dim // dims, 1), (mixer.state_dim * dims, 1, 1), args
         )
 
     def _attention(self, index: int, mixer: LatentAttention, hidden: int, heads: int) -> Launch:
@@ -629,19 +666,21 @@ class KernelDecoder(StaticDecoder):
             int32(hidden + mixer.latent_dim), int32(mixer.nope_dim), int32(mixer.rope_dim), int32(heads * mixer.nope_dim),
             int32(self.max_len), int32(self.splits), float32(self.attention_scales[index]),
         ]
-        return Launch(self._module.kernel("attention_step"), (heads, self.splits, 1), (ATTENTION_THREADS, 1, 1), args)
+        return self._prefetching("attention_step", (heads, self.splits, 1), (ATTENTION_THREADS, 1, 1), args)
 
-    def _sample(self) -> None:
+    def _sample(self, slot: int | None = None) -> None:
         if not self._sample_launches:
             super()._sample()
+            if slot is not None:
+                self.history[slot].copy_(self.token[0])
             return
         runtime.driver().bind(int(self.device.index))
         self.uniform.uniform_()
         stream = torch.cuda.current_stream(self.device).cuda_stream
-        for launch in self._sample_launches:
+        for launch in self._sample_launches if slot is None else self._burst_launches[slot]:
             launch(stream)
 
-    def _step(self, length: int) -> None:
+    def _step(self, length: int, slot: int | None = None) -> None:
         runtime.driver().bind(int(self.device.index))
         stream = torch.cuda.current_stream(self.device).cuda_stream
         if not torch.cuda.is_current_stream_capturing():
@@ -650,4 +689,47 @@ class KernelDecoder(StaticDecoder):
             launch(stream)
         self.position.add_(1)
         if self.sampling:
-            self._sample()
+            self._sample(slot)
+
+    def _capture_burst(self, warmup_steps: int) -> torch.cuda.CUDAGraph | None:
+        saved_position = int(self.position)
+        saved_token = self.token.clone()
+        graph = None
+        try:
+            stream = torch.cuda.Stream(device=self.device)
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+            self._prepare_stream(stream)
+            with torch.cuda.stream(stream):
+                for _ in range(max(1, warmup_steps)):
+                    self.position.fill_(0)
+                    for slot in range(BURST):
+                        self._step(self.max_len, slot)
+            torch.cuda.current_stream(self.device).wait_stream(stream)
+            torch.cuda.synchronize(self.device)
+            graph = torch.cuda.CUDAGraph()
+            self.position.fill_(0)
+            with torch.cuda.graph(graph, stream=stream):
+                for slot in range(BURST):
+                    self._step(self.max_len, slot)
+            torch.cuda.synchronize(self.device)
+        except Exception:
+            graph = None
+        self.position.fill_(saved_position)
+        self.token.copy_(saved_token)
+        return graph
+
+    @torch.no_grad()
+    def advance_many(self, count: int) -> list[int]:
+        """Produce ``count`` tokens; whole bursts of sixteen run as one graph replay with a single read-back."""
+
+        if not self.sampling:
+            raise RuntimeError("this decoder was created without sampling")
+        tokens: list[int] = []
+        burst = self._burst_graph
+        while burst is not None and count - len(tokens) >= BURST and self.host_position + BURST <= self.max_len:
+            burst.replay()
+            self.host_position += BURST
+            tokens.extend(self.history.tolist())
+        while len(tokens) < count:
+            tokens.append(self.advance())
+        return tokens

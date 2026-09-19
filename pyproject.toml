@@ -12,6 +12,7 @@ license = { text = "Apache-2.0" }
 dependencies = [
     "torch>=2.7,<3",
     "numpy>=1.26",
+    "numba>=0.61; python_version < '3.15' and ((sys_platform == 'win32' and platform_machine == 'AMD64') or (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64'))",
     "tokenizers>=0.20,<1",
     "fastapi>=0.110,<1",
     "uvicorn>=0.29,<1",

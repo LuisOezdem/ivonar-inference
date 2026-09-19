@@ -119,13 +119,13 @@ def pull_model(
         plan.append(item)
     total = sum(sizes.get(item, 0) for item in plan)
     done = 0
-    report = progress or (lambda file, done_bytes, total_bytes: None)
     for item in plan:
 
         def advance(count: int, item: str = item) -> None:
             nonlocal done
             done += count
-            report(item, done, total)
+            if progress is not None:
+                progress(item, done, total)
 
         try:
             download_file(file_url(source, item), work / item, sums.get(item), advance)

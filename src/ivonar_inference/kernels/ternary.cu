@@ -108,6 +108,16 @@ __device__ __forceinline__ float block_sum(float v, float* slots) {
   return total;
 }
 
+__device__ __forceinline__ void prefetch_l2(const u8* __restrict__ next, int next_bytes) {
+  if (next == nullptr) return;
+  const int lines = (next_bytes + 127) >> 7;
+  const int blocks = gridDim.x * gridDim.y;
+  const int block = blockIdx.x + blockIdx.y * gridDim.x;
+  for (int line = block * blockDim.x + threadIdx.x; line < lines; line += blocks * blockDim.x) {
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(next + ((size_t)line << 7)));
+  }
+}
+
 __device__ __forceinline__ int q8_offset(int i) {
   const int u = i >> 6;
   const int quad = (i >> 4) & 3;
@@ -284,8 +294,10 @@ __device__ __forceinline__ float chunk_dot_unpacked(
   const float* __restrict__ input, const float* __restrict__ aux, const signed char* __restrict__ q8_in, \
       const int* __restrict__ xsum_in, const float* __restrict__ scale_in, const u8* __restrict__ packed, \
       const half_t* __restrict__ scales, const float* __restrict__ bias, float* __restrict__ output,    \
-      int rows, int n, int row_bytes, int groups, int lanes, int splits, float eps
-#define GEMV_PASS input, aux, q8_in, xsum_in, scale_in, packed, scales, bias, output, rows, n, row_bytes, groups, lanes, splits, eps
+      int rows, int n, int row_bytes, int groups, int lanes, int splits, float eps,                     \
+      const u8* __restrict__ next, int next_bytes
+#define GEMV_PASS \
+  input, aux, q8_in, xsum_in, scale_in, packed, scales, bias, output, rows, n, row_bytes, groups, lanes, splits, eps, next, next_bytes
 
 template <int MODE, int EPI, int PER_THREAD>
 __device__ __forceinline__ void gemv_body(GEMV_ARGS) {
@@ -338,6 +350,7 @@ __device__ __forceinline__ void gemv_body(GEMV_ARGS) {
     if (EPI == EPI_RESIDUAL) output[row] += result;
     else output[row] = result;
   }
+  prefetch_l2(next, next_bytes);
 }
 
 extern "C" __global__ void __launch_bounds__(THREADS) gemv_plain_store(GEMV_ARGS) {
@@ -410,10 +423,11 @@ extern "C" __global__ void __launch_bounds__(RECURRENT_MAX_THREADS) recurrent_st
     float* __restrict__ conv_state, const float* __restrict__ decay, const float* __restrict__ theta,
     const float* __restrict__ skip, float* __restrict__ ssm_state, float* __restrict__ prev_force,
     float* __restrict__ output, int hidden, int state_dim, int head_dim, int conv_taps,
-    float half_dt_min, float half_dt_range, int dims) {
+    float half_dt_min, float half_dt_range, int dims, const u8* __restrict__ next, int next_bytes) {
   __shared__ float partial[RECURRENT_MAX_THREADS];
   __shared__ float values[TILE_HEAD];
   __shared__ float coefficients[RECURRENT_MAX_STATE][5];
+  prefetch_l2(next, next_bytes);
   const int head = blockIdx.x, tid = threadIdx.x;
   const int s = tid / dims, local = tid - s * dims;
   const int dim = blockIdx.y * dims + local;
@@ -496,13 +510,14 @@ extern "C" __global__ void __launch_bounds__(ATTN_THREADS) attention_step(
     const float* __restrict__ qlk, const float* __restrict__ kv, const float* __restrict__ rope,
     const long long* __restrict__ position, half_t* __restrict__ k_cache, half_t* __restrict__ v_cache,
     float* __restrict__ partial, int k_rope_offset, int nope_dim, int rope_dim, int v_offset, int max_len,
-    int splits, float scale) {
+    int splits, float scale, const u8* __restrict__ next, int next_bytes) {
   __shared__ float sq[HEAD_DIM];
   __shared__ float sk[HEAD_DIM];
   __shared__ float sv[HEAD_DIM];
   __shared__ float lane_weight[ATTN_THREADS];
   __shared__ float lane_acc[ATTN_THREADS][HEAD_DIM + 1];
   __shared__ float slots[64];
+  prefetch_l2(next, next_bytes);
   const int head = blockIdx.x, split = blockIdx.y, tid = threadIdx.x;
   const int pos = (int)(*position);
   for (int pair = tid; pair < HALF_DIM; pair += ATTN_THREADS) {
@@ -1085,7 +1100,7 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_token(
     const float* __restrict__ logits, const float* __restrict__ bounds, const float* __restrict__ temperature,
     const float* __restrict__ penalty, const float* __restrict__ inverse_penalty, u8* __restrict__ seen,
     const long long* __restrict__ top_k, const float* __restrict__ uniform, long long* __restrict__ token,
-    int vocab) {
+    long long* __restrict__ history, int vocab) {
   __shared__ unsigned int histogram[SAMPLE_WARPS * 128];
   __shared__ unsigned int suffix[256];
   __shared__ unsigned int totals[256];
@@ -1316,6 +1331,7 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_token(
     if (chosen < 0) chosen = count - 1;
     const int index = pick_index[chosen];
     token[0] = (long long)index;
+    if (history) history[0] = (long long)index;
     seen[index] = 1;
   }
 }

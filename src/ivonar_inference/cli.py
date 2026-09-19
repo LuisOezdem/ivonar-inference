@@ -110,15 +110,22 @@ def _download(name: str = DEFAULT_MODEL, repo: str | None = None) -> Path:
     live = sys.stdout.isatty()
     print(f"[INFO] Downloading {name} from Hugging Face into {user_models_dir()}", flush=True)
 
+    fetched = False
+
     def show(file: str, done: int, total: int) -> None:
+        nonlocal fetched
+        fetched = True
         if live:
             amount = f"{done / 1e6:5.1f} of {total / 1e6:.1f} MB" if total else f"{done / 1e6:5.1f} MB"
             print(f"\r  {amount}", end="", flush=True)
 
     folder = pull_model(name, repo=repo, progress=show)
-    if live:
+    if live and fetched:
         print(flush=True)
-    print(f"[INFO] Saved to {folder}", flush=True)
+    if fetched:
+        print(f"[INFO] Saved to {folder}", flush=True)
+    else:
+        print(f"[INFO] Already up to date in {folder}; every file matches its published checksum", flush=True)
     return folder
 
 
@@ -333,6 +340,9 @@ def _chat(args: argparse.Namespace) -> int:
             elif command == "/model":
                 if not rest:
                     print("[INFO] usage: /model <name>", flush=True)
+                    continue
+                if rest == registry.current:
+                    print(f"[INFO] Already using {rest}.", flush=True)
                     continue
                 try:
                     registry.switch(rest)

@@ -209,6 +209,23 @@ def test_a_model_that_fails_to_load_is_reported_as_such(tmp_path: Path, isolated
     assert client.get("/api/status").json()["ready"] is False
 
 
+def test_pull_says_when_everything_is_already_there(tmp_path: Path, isolated_home: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(cli, "pull_model", lambda name, repo=None, progress=None: _install(isolated_home / "models" / name))
+    assert cli.main(["pull"]) == 0
+    output = capsys.readouterr().out
+    assert "Already up to date" in output
+    assert "Saved to" not in output
+
+
+def test_switching_to_the_model_in_use_keeps_the_conversation(tmp_path: Path, isolated_home: Path, monkeypatch, capsys) -> None:
+    monkeypatch.chdir(tmp_path)
+    _install(isolated_home / "models" / "ivonar-nano")
+    monkeypatch.setattr(Engine, "load", classmethod(lambda cls, model_path, **options: _fake_loader(model_path, **options)))
+    output = _run_chat(monkeypatch, ["/model ivonar-nano", "/exit"], capsys)
+    assert "Already using ivonar-nano." in output
+    assert "New conversation" not in output
+
+
 def test_terminal_chat_can_quit_before_downloading(tmp_path: Path, monkeypatch, capsys) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "pull_model", lambda *args, **kwargs: pytest.fail("nothing should be downloaded"))

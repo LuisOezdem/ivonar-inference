@@ -67,12 +67,12 @@ def run_benchmark(engine: Engine, prompt: str = DEFAULT_PROMPT, tokens: int = 25
         prefill_seconds = time.perf_counter() - started
         decoder.configure_sampling(settings.temperature, settings.top_k, settings.repetition_penalty)
         decoder.sample()
-        for _ in range(warmup):
-            decoder.advance()
+        decoder.advance_many(warmup)
         _synchronize(decoder.device)
         started = time.perf_counter()
-        for _ in range(steps):
-            decoder.advance()
+        done = 0
+        while done < steps:
+            done += len(decoder.advance_many(min(decoder.burst_size, steps - done)))
         _synchronize(decoder.device)
         step_seconds = time.perf_counter() - started
     result = engine.complete(messages, settings)

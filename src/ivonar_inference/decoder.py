@@ -89,6 +89,7 @@ class StaticDecoder:
             raise ValueError("attention_lengths must lie within max_len")
         self.attention_lengths = tuple(sorted(lengths))
         self.host_position = 0
+        self.burst_size = 1
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.cache_dtype = torch.float16 if self.device.type == "cuda" else torch.float32
         self.fuse_projections = True if fuse_projections is None else bool(fuse_projections)
@@ -377,6 +378,12 @@ class StaticDecoder:
         self._run_step()
         return int(self.token[0])
 
+    @torch.no_grad()
+    def advance_many(self, count: int) -> list[int]:
+        """Produce ``count`` tokens, each fed back into the next step."""
+
+        return [self.advance() for _ in range(count)]
+
     def _run_step(self) -> None:
         length = self.attention_length(self.host_position)
         graph = self.graphs.get(length)
@@ -489,10 +496,23 @@ def build_decoder(
         gc.collect()
         torch.cuda.empty_cache()
     _ensure_torch_weights(model, target)
+    if kernels and target.type == "cpu":
+        try:
+            return _cpu_decoder(model, sampling, max_top_k), "ternary", None
+        except Exception as exc:
+            note = f"ternary CPU kernels unavailable, using the torch decoder: {exc}"
     decoder = StaticDecoder(model, device=target, sampling=sampling, max_top_k=max_top_k)
     if target.type != "cpu":
         decoder.self_check()
     return decoder, "torch", note
+
+
+def _cpu_decoder(model: IvonarModel, sampling: bool, max_top_k: int) -> StaticDecoder:
+    from .cpu_decoder import CpuDecoder
+
+    decoder = CpuDecoder(model, sampling=sampling, max_top_k=max_top_k)
+    decoder.self_check()
+    return decoder
 
 
 def _kernel_decoder(

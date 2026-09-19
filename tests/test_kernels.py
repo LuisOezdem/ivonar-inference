@@ -183,8 +183,8 @@ def test_engine_load_serves_the_ternary_kernels(tmp_path: Path) -> None:
     assert type(fallback.decoder) is StaticDecoder
 
 
-def test_build_decoder_without_a_gpu_uses_the_torch_decoder() -> None:
-    decoder, backend, note = build_decoder(tiny_model(seed=1), "cpu", sampling=True, kernels=True)
+def test_build_decoder_without_kernels_uses_the_torch_decoder() -> None:
+    decoder, backend, note = build_decoder(tiny_model(seed=1), "cpu", sampling=True, kernels=False)
     assert type(decoder) is StaticDecoder
     assert backend == "torch"
     assert note is None
@@ -218,3 +218,25 @@ def test_benchmark_reports_prefill_and_decode(tmp_path: Path) -> None:
     assert 1 <= result.step_tokens <= 4
     assert result.step_tokens_per_second > 0
     assert len(result.lines()) == 3
+
+
+@cuda
+def test_bursts_produce_the_same_tokens_as_single_steps() -> None:
+    from ivonar_inference.kernel_decoder import BURST, KernelDecoder
+
+    config = _config(16, 4, 3, 8, 32, vocab_size=300, seq_len=64)
+    model = build_model(config, tiny_state(config, seed=21)).to("cuda").eval()
+    decoder = KernelDecoder(model, device="cuda", sampling=True)
+    assert decoder.capture()
+    assert decoder.burst_size == BURST
+    prompt = torch.tensor([[5, 9, 14, 3]], device="cuda")
+    runs = []
+    for bursts in (True, False):
+        decoder.prefill(prompt)
+        decoder.configure_sampling(temperature=1.0, top_k=1, repetition_penalty=50.0)
+        first = decoder.sample()
+        rest = decoder.advance_many(2 * BURST + 3) if bursts else [decoder.advance() for _ in range(2 * BURST + 3)]
+        runs.append([first, *rest])
+        assert decoder.host_position == 4 + 2 * BURST + 3
+    assert runs[0] == runs[1]
+    assert len(set(runs[0])) > 1

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Iterable, Iterator
 
 import torch
@@ -21,10 +22,11 @@ def stream_text(
 ) -> Iterator[str]:
     """Yield the answer as text increments whose concatenation is the answer.
 
-    The decoder samples every token on its device, so a step is one graph
-    replay and one id read. A byte-level tokenizer can leave an incomplete
-    character at the end of a partial decode, so the trailing replacement
-    characters are held back until the next token completes them.
+    The decoder samples every token on its device and hands them over in
+    bursts, so the host reads a handful of ids per graph replay. Only the
+    tokens around the newest one are decoded again: a byte-level tokenizer
+    can leave an incomplete character at the end of a partial decode, so
+    text is held back until the next token completes it.
     ``penalized_text`` starts the repetition penalty on the words it contains,
     which the caller uses to discourage repeating the previous answer.
     """
@@ -44,21 +46,26 @@ def stream_text(
         penalized_ids=tokenizer.encode(penalized_text) if penalized_text else (),
     )
     generated: list[int] = []
-    emitted = ""
+    prefix_offset = read_offset = 0
     context_tokens = len(token_ids)
-    next_id = decoder.sample()
+    pending = deque([decoder.sample()])
     for token_index in range(max_new_tokens):
+        next_id = pending.popleft()
         if context_tokens >= max_context or next_id in stop_ids:
             break
         generated.append(next_id)
         context_tokens += 1
-        stable = tokenizer.decode(generated).rstrip("�")
-        if stable.startswith(emitted) and len(stable) > len(emitted):
-            yield stable[len(emitted) :]
-            emitted = stable
-        if token_index + 1 >= max_new_tokens or context_tokens >= max_context:
+        shown = tokenizer.decode(generated[prefix_offset:read_offset])
+        text = tokenizer.decode(generated[prefix_offset:])
+        if len(text) > len(shown) and not text.endswith("�"):
+            yield text[len(shown) :]
+            prefix_offset, read_offset = read_offset, len(generated)
+        remaining = min(max_new_tokens - token_index - 1, max_context - context_tokens)
+        if remaining <= 0:
             break
-        next_id = decoder.advance()
-    final = tokenizer.decode(generated)
-    if final.startswith(emitted) and len(final) > len(emitted):
-        yield final[len(emitted) :]
+        if not pending:
+            pending.extend(decoder.advance_many(min(decoder.burst_size, remaining)))
+    shown = tokenizer.decode(generated[prefix_offset:read_offset])
+    text = tokenizer.decode(generated[prefix_offset:])
+    if text.startswith(shown) and len(text) > len(shown):
+        yield text[len(shown) :]

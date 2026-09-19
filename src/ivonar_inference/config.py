@@ -35,8 +35,6 @@ class ModelConfig:
     final_context: int
     rope_base: float
     longrope_scaling: str
-    pad_token_id: int
-    endoftext_token_id: int
 
     @classmethod
     def from_payload(cls, config: Any) -> "ModelConfig":
@@ -73,6 +71,4 @@ class ModelConfig:
             final_context=int(config.get("final_context", 8192)),
             rope_base=float(config.get("rope_base", 10000.0)),
             longrope_scaling=str(config.get("longrope_scaling", "linear")),
-            pad_token_id=int(config.get("pad_token_id", 0)),
-            endoftext_token_id=int(config.get("endoftext_token_id", 1)),
         )
