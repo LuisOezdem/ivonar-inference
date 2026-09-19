@@ -1,67 +1,73 @@
 # Ivonar Inference
 
-Run Ivonar Nano locally: a terminal chat, an OpenAI-compatible server with a
-chat page, ternary CUDA kernels that read the 2-bit weights as they are stored,
-and a check that the served model matches its reference.
+Run Ivonar Nano on your own computer: a chat page, a terminal chat, an
+OpenAI-compatible API, and CUDA kernels that read the ternary 2-bit weights as
+they are stored.
 
 Model: [huggingface.co/Ivonar/ivonar-nano](https://huggingface.co/Ivonar/ivonar-nano) ·
 Project: [ivonar.com](https://ivonar.com/)
 
 ## Install
 
+macOS and Linux:
+
 ```bash
-pip install .
+curl -fsSL https://raw.githubusercontent.com/LuisCode28/ivonar-inference/main/install.sh | sh
 ```
 
-Python 3.12 or newer. A CUDA build of PyTorch is needed for GPU decoding; the
-kernels compile themselves on first start, no CUDA toolkit is required.
+Windows, in PowerShell:
 
-## Add a model
+```powershell
+irm https://raw.githubusercontent.com/LuisCode28/ivonar-inference/main/install.ps1 | iex
+```
 
-Download the release from
-[huggingface.co/Ivonar/ivonar-nano](https://huggingface.co/Ivonar/ivonar-nano) and put it into
-its own folder under `models/`:
+The command installs [uv](https://docs.astral.sh/uv/), which brings its own
+Python, then Ivonar with the matching PyTorch build, CUDA when an NVIDIA GPU is
+present, and opens the chat page in your browser. Click **Download Ivonar
+Nano** once: the model, about 100 MB, is saved to `~/.ivonar/models` and the
+chat starts as soon as it is ready. Without a usable NVIDIA GPU Ivonar runs on
+the CPU; the install takes about 3 GB of disk, mostly PyTorch.
+
+Next time run `ivonar serve`, or `ivonar chat` for the terminal, where
+`/download` fetches the model the same way. Running the install command again
+updates Ivonar. To remove it, run `uv tool uninstall ivonar-inference` and
+delete `~/.ivonar`.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `ivonar serve` | Chat page and API on `http://127.0.0.1:8000/`, opened in the browser. The next free port is used when 8000 is busy; `--no-browser` skips opening it. |
+| `ivonar chat` | Terminal chat. `/help` lists `/new`, `/system`, `/model`, `/set temperature=0.7`, `/exit`. |
+| `ivonar pull [name]` | Download a release from Hugging Face, verified against its published checksums. |
+| `ivonar models` | List what is installed. |
+| `ivonar bench` | Time prefill, decode and a full answer. |
+| `ivonar verify` | Compare the served decoder against the single-precision reference. |
+
+`--device` defaults to `auto`: the CUDA GPU when this PyTorch build runs on it,
+otherwise the CPU. `--no-kernels` forces the torch decoder, `--no-graph` runs
+either eagerly.
+
+## Models
+
+Every model lives in its own folder:
 
 ```
-models/
+~/.ivonar/models/
   ivonar-nano/
     packed_inference_checkpoint.pt
     tokenizer.json
+    config.json, LICENSE, README.md, attribution_bundle.md
 ```
 
-That is the whole setup. `ivonar models` lists what it finds, the first one is
-loaded, and `--model ivonar-nano` picks another; both the chat page and the
-terminal switch between installed models while running. The folder name is the
-model id the API reports.
+Downloads are checked against the published checksums and resume where they
+stopped. A model folder dragged in by hand works too, as soon as its checkpoint
+and `tokenizer.json` are complete; a page waiting for a model loads it by
+itself. `ivonar pull <name>` fetches further releases.
 
-`--device` defaults to `auto`: a CUDA GPU when present, otherwise the CPU, with
-a fallback to the CPU if the GPU refuses the model.
-
-## Run
-
-```bash
-ivonar serve
-```
-
-Opens a chat page on `http://127.0.0.1:8000/` with stored conversations,
-search, rename, a model picker, a settings dialog, streaming answers, and light
-and dark themes.
-
-```bash
-ivonar chat
-```
-
-Chats in the terminal. `/help` lists the commands: `/new`, `/system`, `/model`,
-`/models`, `/set temperature=0.7`, `/stats`, `/exit`. When a conversation
-outgrows the context the oldest turns are dropped automatically.
-
-```bash
-ivonar bench
-ivonar verify
-```
-
-`bench` times the prompt prefill, the decode step and a full answer. `verify`
-compares the served decoder against the single-precision reference.
+`models/` in the current directory and in a clone of this repository is
+searched too. `--model <name>` picks a model; `IVONAR_HOME` moves models, chat
+history and the kernel cache away from `~/.ivonar`.
 
 ## API
 
@@ -74,50 +80,46 @@ next request.
 
 ## Ternary kernels
 
-On a GPU the decode step runs through CUDA kernels written for the ternary
-format. Every weight matrix stays packed, four ternary values per byte with one
-float16 scale per 128 inputs, activations are quantized to int8 per token inside
-the kernel, dot products run on `dp4a`, and results accumulate in fp32, so the
+Every weight matrix stays packed: four ternary values per byte with one float16
+scale per 128 inputs. Activations are quantized to int8 per token inside the
+kernel, dot products run on `dp4a`, and results accumulate in fp32, so the
 arithmetic follows the reference model's own quantization rule.
 
-One token is a single CUDA graph of 129 launches: fused normalize, quantize and
+One token is a single CUDA graph of 131 launches: fused normalize, quantize and
 matrix-vector kernels, one kernel for the Mamba recurrence, one for latent
-attention, a fused top-k sampler, and the output head pinned in the persisting
-part of the L2 cache. Prompts run through the same kernels in 32-token tiles,
-so no fp16 weight copies exist; Ivonar Nano occupies about 275 MiB of GPU
-memory. The tiles win up to a few hundred prompt tokens; past roughly a
-thousand the torch prefill is faster.
+attention, a two-stage top-k sampler that scans only the logit groups which can
+hold a candidate, and the output head pinned in the persisting part of the L2
+cache. Prompts run through the same kernels in 32-token tiles, so no fp16 weight
+copies exist; Ivonar Nano occupies 242 MiB of GPU memory. The tiles win up to a
+few hundred prompt tokens; past roughly a thousand the torch prefill is faster.
 
-The kernels compile with NVRTC from the torch installation the first time a
-model loads and are cached in `~/.ivonar/kernels`. Where they cannot be built
-the engine falls back to the torch decoder and says so in the status line.
-`--no-kernels` forces the torch decoder, `--no-graph` runs either decoder
-eagerly.
+Kernels compile with NVRTC from the torch installation on first load and are
+cached in `~/.ivonar/kernels`. Before the first chat a short prompt runs through
+the tile and the step kernels, which must agree. When the kernels cannot be
+built or fail that check, the torch decoder takes over, and when the GPU fails
+altogether, the CPU; the status line says which.
 
 ## Speed
 
-Measured on an RTX 4060 Ti with Ivonar Nano, 4096-token context.
+Measured with Ivonar Nano on an RTX 4060 Ti and a Ryzen 9 3900X, 4096-token
+context.
 
 | Setup | Decode | Notes |
 |---|---|---|
-| Ternary kernels, CUDA graph (default) | 1,078 tokens per second | 36-token prompt in 9 ms, 465 tokens in 68 ms, 275 MiB of GPU memory |
-| Ternary kernels, `--no-graph` | about 850 tokens per second | one launch per kernel from Python |
-| Torch decoder, `--no-kernels` | 187 tokens per second | fp16 weights, 1.3 GB of GPU memory |
-| CPU | 8 to 12 tokens per second | |
+| Ternary kernels, CUDA graph (default) | about 1,200 tokens per second | 36-token prompt in 7 ms, 465 tokens in 57 ms, 242 MiB |
+| Ternary kernels, `--no-graph` | 900 tokens per second | one launch per kernel from Python |
+| Torch decoder, `--no-kernels` | 187 tokens per second | fp16 weights, 0.9 GB |
+| CPU | 24 tokens per second | float16 weights where the CPU is faster with them, 36-token prompt in 0.27 s |
 
-A 36-token prompt with a 256-token answer runs end to end at about 1000 tokens
-per second. `ivonar verify` reports the same agreement with the reference for
-both decoders: top-1 agreement above 0.95 and a mean logit difference of 0.047,
-the noise floor of the model's own int8 activation quantization.
+A 36-token prompt with a 256-token answer runs end to end at about 1,100 tokens
+per second, with the same agreement to the reference as the torch decoder in
+`ivonar verify`. One token reads 92.7 MB of weights and this card streams at
+most 269 GB/s, so no decoder on it can beat about 2,900 tokens per second.
 
-Every answer reports its time to the first token and its decoding speed
-separately, in the terminal, on the chat page and in the chats API. The two
+Answers report time to the first token and decoding speed separately. They
 differ after a pause: Windows parks an idle GeForce in its lowest power state
-after roughly ten seconds, and it takes a few hundred milliseconds of work to
-return to full clocks, so a short answer typed after a break runs at a third of
-the speed. To keep the clocks up while the server runs, set the NVIDIA Control
-Panel power management mode to "Prefer maximum performance" for `python.exe`;
-it costs idle power, which is why the program does not do it for you.
+after about ten seconds, and waking it takes a few hundred milliseconds. The
+NVIDIA Control Panel setting "Prefer maximum performance" avoids that.
 
 ## Defaults
 
@@ -130,7 +132,7 @@ the settings dialog. They were picked by scoring 83 system messages on a
 Ivonar Nano is a 349M model: arithmetic is right about a third of the time and
 facts about two thirds.
 
-## Test
+## Development
 
 ```bash
 pip install -e ".[test]"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import torch
 import torch.nn.functional as F
@@ -48,9 +49,56 @@ def _zero(device: torch.device) -> Tensor:
     return zero
 
 
+_cpu_half: bool | None = None
+
+
+def _best_time(run) -> float:
+    run()
+    timings = []
+    for _ in range(5):
+        start = time.perf_counter()
+        for _ in range(4):
+            run()
+        timings.append(time.perf_counter() - start)
+    return min(timings)
+
+
+def cpu_prefers_half() -> bool:
+    """Whether this CPU multiplies a vector by float16 weights clearly faster than by float32 ones.
+
+    Measured once per process: CPUs with fast half-precision conversion
+    decode about twice as fast from float16 weights, older ones slower.
+    """
+
+    global _cpu_half
+    if _cpu_half is None:
+        try:
+            generator = torch.Generator().manual_seed(0)
+            weight = torch.randn(2048, 1024, generator=generator)
+            vector = torch.randn(1, 1024, generator=generator)
+            half_weight, half_vector = weight.half(), vector.round().half()
+            full = _best_time(lambda: F.linear(vector, weight))
+            half = _best_time(lambda: F.linear(half_vector, half_weight))
+            _cpu_half = half < 0.8 * full
+        except Exception:
+            _cpu_half = False
+    return _cpu_half
+
+
+def runtime_dtype(device: torch.device | str) -> torch.dtype:
+    """The precision the unpacked weights are kept in on ``device``; either holds the ternary values exactly."""
+
+    kind = torch.device(device).type
+    if kind == "cuda" or (kind == "cpu" and cpu_prefers_half()):
+        return torch.float16
+    return torch.float32
+
+
 def quantized_linear(x: Tensor, weight: Tensor, bias: Tensor | None, eps: float = 1e-5) -> Tensor:
     if weight.dtype == x.dtype:
         return F.linear(quantize_activations(x, eps), weight, bias)
+    if weight.device.type == "cpu" and x.numel() > x.shape[-1]:
+        return F.linear(quantize_activations(x, eps), weight.to(dtype=x.dtype), bias)
     amax = torch.linalg.vector_norm(x.detach(), ord=float("inf"), dim=-1, keepdim=True)
     bound = amax.clamp_min_(127.0 * eps)
     zero = _zero(x.device)

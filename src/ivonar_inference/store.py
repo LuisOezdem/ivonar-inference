@@ -33,6 +33,12 @@ class ChatStore:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._last = 0.0
+
+    def _now(self) -> float:
+        now = max(time.time(), self._last + 1e-6)
+        self._last = now
+        return now
 
     def _path(self, chat_id: str) -> Path:
         if not chat_id or not all(ch.isalnum() for ch in chat_id):
@@ -65,9 +71,9 @@ class ChatStore:
         return [chat.summary() for chat in chats]
 
     def create(self, title: str = "New chat") -> Chat:
-        now = time.time()
-        chat = Chat(id=uuid.uuid4().hex[:12], title=title.strip() or "New chat", created=now, updated=now)
         with self._lock:
+            now = self._now()
+            chat = Chat(id=uuid.uuid4().hex[:12], title=title.strip() or "New chat", created=now, updated=now)
             self._write(chat)
         return chat
 
@@ -79,7 +85,7 @@ class ChatStore:
         with self._lock:
             chat = self._read(chat_id)
             chat.title = title.strip() or chat.title
-            chat.updated = time.time()
+            chat.updated = self._now()
             self._write(chat)
             return chat
 
@@ -89,7 +95,16 @@ class ChatStore:
             chat.messages.append({"role": role, "content": content})
             if chat.title == "New chat" and role == "user":
                 chat.title = content.strip().splitlines()[0][:48] if content.strip() else chat.title
-            chat.updated = time.time()
+            chat.updated = self._now()
+            self._write(chat)
+            return chat
+
+    def drop_answer(self, chat_id: str) -> Chat:
+        with self._lock:
+            chat = self._read(chat_id)
+            while chat.messages and chat.messages[-1]["role"] == "assistant":
+                chat.messages.pop()
+            chat.updated = self._now()
             self._write(chat)
             return chat
 

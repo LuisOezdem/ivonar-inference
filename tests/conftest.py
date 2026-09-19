@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from ivonar_inference import paths
 from ivonar_inference.config import ModelConfig
 from ivonar_inference.engine import Engine, GenerationSettings, ModelInfo
 from ivonar_inference.loader import build_model, materialize_weights
@@ -152,6 +153,14 @@ def fake_stream(**kwargs) -> Iterator[str]:
 
 
 fake_stream.calls = []
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path_factory.mktemp("ivonar-home")
+    monkeypatch.setenv("IVONAR_HOME", str(home))
+    monkeypatch.setattr(paths, "source_checkout", lambda: None)
+    return home
 
 
 @pytest.fixture

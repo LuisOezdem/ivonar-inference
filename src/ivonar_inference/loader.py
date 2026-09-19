@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,18 +12,71 @@ from .config import ModelConfig
 from .layers import GatedFeedForward, TokenHead, RMSNorm
 from .recurrent import RecurrentMixer
 from .model import IvonarBlock, IvonarModel
-from .quantization import TernaryLinear
+from .quantization import TernaryLinear, runtime_dtype
 
 PACKED_FORMAT = "ivonar_packed_ternary_inference"
 PACKED_SCHEMA_VERSION = 1
 
 
+def _built_for(major: int, minor: int) -> bool:
+    arches = torch.cuda.get_arch_list()
+    if not arches:
+        return True
+    for arch in arches:
+        kind, _, digits = arch.partition("_")
+        digits = digits.rstrip("af")
+        if len(digits) < 2 or not digits.isdigit():
+            continue
+        built = (int(digits[:-1]), int(digits[-1]))
+        if kind == "sm" and built[0] == major and built[1] <= minor:
+            return True
+        if kind == "compute" and built <= (major, minor):
+            return True
+    return False
+
+
+def _cuda_problem() -> str | None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            if torch.version.cuda is not None:
+                major, minor = torch.cuda.get_device_capability()
+                if not _built_for(major, minor):
+                    return (
+                        f"{torch.cuda.get_device_name()} (compute capability {major}.{minor}) "
+                        "is not supported by this PyTorch build"
+                    )
+            probe = torch.arange(4, dtype=torch.float32, device="cuda") * 2
+            if float(probe.sum().item()) != 12.0:
+                return "the CUDA GPU returned wrong results"
+        except Exception as exc:
+            return f"the CUDA GPU did not respond ({type(exc).__name__}: {exc})"
+    return None
+
+
+def pick_device(requested: str = "auto") -> tuple[str, str | None]:
+    """The device to run on and, when a GPU is present but unusable, the reason the CPU was chosen."""
+
+    if requested.strip().lower() != "auto":
+        return requested, None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            present = torch.cuda.is_available()
+        except Exception:
+            present = False
+    if not present:
+        return "cpu", None
+    problem = _cuda_problem()
+    if problem is not None:
+        return "cpu", f"{problem}; running on the CPU"
+    return "cuda", None
+
+
 def resolve_device(requested: str = "auto") -> str:
     """Turn ``auto`` into the fastest device this machine can actually run."""
 
-    if requested.strip().lower() != "auto":
-        return requested
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    return pick_device(requested)[0]
 
 
 @dataclass(frozen=True)
@@ -191,7 +245,7 @@ def load_model(
     model.to(target)
     model.eval()
     if materialize:
-        materialize_weights(model, torch.float16 if target.type == "cuda" else torch.float32)
+        materialize_weights(model, runtime_dtype(target))
     return LoadedModel(
         model=model,
         config=config,

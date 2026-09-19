@@ -26,6 +26,7 @@ class FakeRegistry(ModelRegistry):
             folder = root / "models" / name
             folder.mkdir(parents=True, exist_ok=True)
             (folder / "packed_inference_checkpoint.pt").write_bytes(b"x")
+            (folder / "tokenizer.json").write_text("{}", encoding="utf-8")
         super().__init__(
             engines[current],
             root / "models" / current / "packed_inference_checkpoint.pt",

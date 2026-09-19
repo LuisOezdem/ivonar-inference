@@ -8,6 +8,7 @@ import torch
 from ivonar_inference.config import ModelConfig
 from ivonar_inference.engine import Engine, GenerationSettings
 from ivonar_inference.loader import PACKED_FORMAT, PACKED_SCHEMA_VERSION, build_model, load_model
+from ivonar_inference.quantization import runtime_dtype
 from ivonar_inference.tokenizer import TernaryTokenizer, format_chat_messages, tokenizer_file_sha256
 from conftest import CONTRACT, tiny_config, tiny_state, tiny_tokenizer_file
 
@@ -117,7 +118,7 @@ def test_load_model_checks_format_and_tokenizer(tmp_path: Path) -> None:
     model_file = _write_checkpoint(tmp_path / "packed_inference_checkpoint.pt", config, sha)
     loaded = load_model(model_file, device="cpu", expected_tokenizer_sha256=sha)
     assert loaded.lineup == "nano" and loaded.stage == "sft" and loaded.step == 7
-    assert loaded.model.token_io.projection.cached_runtime_weight("cpu").dtype == torch.float32
+    assert loaded.model.token_io.projection.cached_runtime_weight("cpu").dtype == runtime_dtype("cpu")
     with pytest.raises(RuntimeError, match="SHA-256 mismatch"):
         load_model(model_file, device="cpu", expected_tokenizer_sha256="0" * 64)
     _write_checkpoint(tmp_path / "other.pt", config, sha, schema_version=2)

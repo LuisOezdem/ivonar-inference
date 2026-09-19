@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from .attention import LatentAttention
 from .layers import RMSNorm
 from .recurrent import RecurrentMixer
 from .model import IvonarModel
-from .quantization import TernaryLinear, quantized_linear
+from .quantization import TernaryLinear, quantized_linear, runtime_dtype
 
 
 def _default_attention_lengths(max_len: int) -> tuple[int, ...]:
@@ -48,9 +49,13 @@ def _fuse_projections(projections: tuple[TernaryLinear, ...], device: torch.devi
     if any(bias is None for bias in biases) != all(bias is None for bias in biases):
         return None
     bias = None if biases[0] is None else torch.cat([b.to(device) for b in biases], dim=0)
-    return _FusedProjection(
-        torch.cat(weights, dim=0), bias, tuple(int(weight.shape[0]) for weight in weights), float(projections[0].eps)
-    )
+    fused = torch.cat(weights, dim=0)
+    start = 0
+    for projection, weight in zip(projections, weights):
+        rows = int(weight.shape[0])
+        projection._runtime_weight = fused[start : start + rows]
+        start += rows
+    return _FusedProjection(fused, bias, tuple(int(weight.shape[0]) for weight in weights), float(projections[0].eps))
 
 
 class StaticDecoder:
@@ -86,7 +91,7 @@ class StaticDecoder:
         self.host_position = 0
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.cache_dtype = torch.float16 if self.device.type == "cuda" else torch.float32
-        self.fuse_projections = self.device.type == "cuda" if fuse_projections is None else bool(fuse_projections)
+        self.fuse_projections = True if fuse_projections is None else bool(fuse_projections)
         self.token = torch.zeros(self.batch_size, dtype=torch.int64, device=self.device)
         self.position = torch.zeros(1, dtype=torch.int64, device=self.device)
         self.logits = torch.zeros(
@@ -153,6 +158,8 @@ class StaticDecoder:
         self.recurrent_constants[index] = {
             "double_cdecay": 2.0 * torch.complex(decay, theta).view(1, mixer.num_heads, mixer.state_dim, 1),
             "skip": mixer.skip.to(self.device).view(1, mixer.num_heads, mixer.head_dim),
+            "conv_taps": mixer.conv_weight[:, 0, :].contiguous().to(self.device),
+            "conv_bias": mixer.conv_bias.to(self.device),
             "half_dt_min": torch.tensor([0.5 * mixer.dt_min], dtype=torch.float32, device=self.device),
             "half_dt_range": torch.tensor(
                 [0.5 * (mixer.dt_max - mixer.dt_min)], dtype=torch.float32, device=self.device
@@ -235,7 +242,7 @@ class StaticDecoder:
             value_gate, bc_dt = mixer.in_proj(h), mixer.bc_dt_proj(h)
         value, gate = value_gate.chunk(2, dim=-1)
         window = torch.cat((state["conv_state"], value.unsqueeze(-1)), dim=-1)
-        convolved = F.conv1d(window, mixer.conv_weight, mixer.conv_bias, groups=mixer.hidden_dim)
+        convolved = (window * constants["conv_taps"]).sum(dim=-1).add_(constants["conv_bias"])
         state["conv_state"].copy_(window[:, :, 1:])
         value = F.silu(convolved).view(batch_size, heads, head_dim)
         gate = torch.sigmoid(gate).reshape(batch_size, heads, head_dim)
@@ -393,11 +400,11 @@ class StaticDecoder:
             return False
         saved_position = int(self.position)
         saved_token = self.token.clone()
-        stream = torch.cuda.Stream(device=self.device)
-        stream.wait_stream(torch.cuda.current_stream(self.device))
-        self._prepare_stream(stream)
         graphs: dict[int, torch.cuda.CUDAGraph] = {}
         try:
+            stream = torch.cuda.Stream(device=self.device)
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+            self._prepare_stream(stream)
             for length in self.attention_lengths:
                 with torch.cuda.stream(stream):
                     for _ in range(max(1, warmup_steps)):
@@ -412,15 +419,27 @@ class StaticDecoder:
                 torch.cuda.synchronize(self.device)
                 graphs[length] = graph
         except Exception:
-            self.graphs = {}
-            return False
+            graphs = {}
         self.graphs = graphs
         self.position.fill_(saved_position)
         self.token.copy_(saved_token)
-        return True
+        return bool(graphs)
 
     def _prepare_stream(self, stream: torch.cuda.Stream) -> None:
         return None
+
+    @torch.no_grad()
+    def self_check(self) -> None:
+        """Run a few tokens through the decoder, so a device that cannot run it fails while loading."""
+
+        vocab = int(self.model.config.vocab_size)
+        ids = torch.randint(2, vocab, (self.batch_size, 4), generator=torch.Generator().manual_seed(0))
+        prefilled = bool(torch.isfinite(self.prefill(ids)).all())
+        self.step(ids[:, -1])
+        stepped = bool(torch.isfinite(self.logits).all())
+        self.reset()
+        if not (prefilled and stepped):
+            raise RuntimeError(f"the decoder produced invalid numbers on {self.device}")
 
     @torch.no_grad()
     def step(self, token: Tensor) -> Tensor:
@@ -447,7 +466,7 @@ def _ensure_torch_weights(model: IvonarModel, device: torch.device) -> None:
         module.cached_runtime_weight(device) is None for module in model.modules() if isinstance(module, TernaryLinear)
     )
     if missing:
-        materialize_weights(model, torch.float16 if device.type == "cuda" else torch.float32)
+        materialize_weights(model, runtime_dtype(device))
 
 
 def build_decoder(
@@ -460,19 +479,31 @@ def build_decoder(
     """The decoder the engine serves: ternary CUDA kernels where they compile, the torch step otherwise."""
 
     target = torch.device(device)
+    note = None
     if kernels and target.type == "cuda":
-        from .kernel_decoder import KernelDecoder
-        from .kernels.runtime import KernelError
-
         try:
-            decoder = KernelDecoder(model, device=target, sampling=sampling, max_top_k=max_top_k)
-        except (KernelError, OSError, RuntimeError) as exc:
-            _ensure_torch_weights(model, target)
+            decoder, note = _kernel_decoder(model, target, sampling, max_top_k)
+            return decoder, "ternary", note
+        except Exception as exc:
             note = f"ternary kernels unavailable, using the torch decoder: {exc}"
-            return StaticDecoder(model, device=target, sampling=sampling, max_top_k=max_top_k), "torch", note
-        if decoder.tile_prefill:
-            return decoder, "ternary", None
-        _ensure_torch_weights(model, target)
-        return decoder, "ternary", "tile prefill does not support this model shape, prompts run through the torch path"
+        gc.collect()
+        torch.cuda.empty_cache()
     _ensure_torch_weights(model, target)
-    return StaticDecoder(model, device=target, sampling=sampling, max_top_k=max_top_k), "torch", None
+    decoder = StaticDecoder(model, device=target, sampling=sampling, max_top_k=max_top_k)
+    if target.type != "cpu":
+        decoder.self_check()
+    return decoder, "torch", note
+
+
+def _kernel_decoder(
+    model: IvonarModel, target: torch.device, sampling: bool, max_top_k: int
+) -> tuple[StaticDecoder, str | None]:
+    from .kernel_decoder import KernelDecoder
+
+    decoder = KernelDecoder(model, device=target, sampling=sampling, max_top_k=max_top_k)
+    note = None
+    if not decoder.tile_prefill:
+        _ensure_torch_weights(model, target)
+        note = "tile prefill does not support this model shape, prompts run through the torch path"
+    decoder.self_check()
+    return decoder, note

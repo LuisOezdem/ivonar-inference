@@ -11,7 +11,9 @@ from pathlib import Path
 
 import torch
 
-CACHE_DIR = Path.home() / ".ivonar" / "kernels"
+from ..paths import ivonar_home
+
+CACHE_DIR = ivonar_home() / "kernels"
 _COMPILE_OPTIONS = ("-default-device", "--std=c++17")
 _LIMIT_PERSISTING_L2 = 6
 _ATTRIBUTE_MAX_PERSISTING_L2 = 108
@@ -60,7 +62,7 @@ class _Nvrtc:
             candidates = [name, str(torch_lib / name)]
         else:
             candidates = [f"libnvrtc.so.{major}", "libnvrtc.so"]
-            for nvidia_lib in Path(torch.__file__).parent.parent.glob("nvidia/cuda_nvrtc/lib/libnvrtc.so*"):
+            for nvidia_lib in sorted(Path(torch.__file__).parent.parent.glob("nvidia/**/libnvrtc.so*")):
                 candidates.append(str(nvidia_lib))
         lib = _library(candidates)
         lib.nvrtcVersion.argtypes = [POINTER(c_int), POINTER(c_int)]

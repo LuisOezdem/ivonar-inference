@@ -7,8 +7,12 @@
 #ifndef MAX_TOPK
 #define MAX_TOPK 256
 #endif
+#ifndef THREADS
 #define THREADS 256
+#endif
+#ifndef PREFETCH
 #define PREFETCH 4
+#endif
 #define NARROW_PER_THREAD 4
 #define WIDE_PER_THREAD ((MAX_CHUNKS * 64 + THREADS - 1) / THREADS)
 #define ATTN_THREADS 64
@@ -37,6 +41,9 @@
 #define SAMPLE_WARPS (SAMPLE_THREADS / 32)
 #define SAMPLE_BATCH 4
 #define SAMPLE_DELTAS 6
+#define BOUND_GROUP 64
+#define SAMPLE_GROUPS 1024
+#define BOUND_BUCKETS 16
 #define NEG_INF __int_as_float(0xff800000)
 
 typedef unsigned short half_t;
@@ -179,6 +186,48 @@ __device__ __forceinline__ float quantize_source(
   return scale;
 }
 
+template <int MODE>
+__device__ __forceinline__ float quantize_stream(
+    const float* __restrict__ input, const float* __restrict__ aux, int n, float eps, int splits,
+    signed char* q8, int* xsum, float* slots) {
+  const int tid = threadIdx.x;
+  const int chunks = (n + 63) >> 6;
+  float inv_rms = 1.0f;
+  if (MODE == MODE_NORM) {
+    float squares = 0.0f;
+    for (int i = tid; i < n; i += THREADS) {
+      const float v = input[i];
+      squares += v * v;
+    }
+    squares = block_sum(squares, slots);
+    inv_rms = rsqrtf(squares / (float)n + eps);
+  }
+  float amax = 0.0f;
+  for (int i = tid; i < n; i += THREADS) {
+    float v = source_value<MODE>(input, aux, i, n, splits);
+    if (MODE == MODE_NORM) v = fminf(fmaxf(v * inv_rms, -8.0f), 8.0f) * aux[i];
+    amax = fmaxf(amax, fabsf(v));
+  }
+  amax = block_max(amax, slots + 32);
+  const float scale = fmaxf(amax / 127.0f, 1e-5f);
+  for (int i = n + tid; i < chunks * 64; i += THREADS) q8[q8_offset(i)] = 0;
+  for (int i = tid; i < n; i += THREADS) {
+    float v = source_value<MODE>(input, aux, i, n, splits);
+    if (MODE == MODE_NORM) v = fminf(fmaxf(v * inv_rms, -8.0f), 8.0f) * aux[i];
+    q8[q8_offset(i)] = (signed char)(int)rintf(v / scale);
+  }
+  __syncthreads();
+  if (tid < chunks) {
+    const int* words = (const int*)q8 + tid * 16;
+    int total = 0;
+#pragma unroll
+    for (int w = 0; w < 16; ++w) total = dp4a(words[w], 0x01010101, total);
+    xsum[tid] = total;
+  }
+  __syncthreads();
+  return scale;
+}
+
 __device__ __forceinline__ int quad_dot(unsigned int w, const int4 a, int dot) {
   dot = dp4a(w & 0x03030303, a.x, dot);
   dot = dp4a((w >> 2) & 0x03030303, a.y, dot);
@@ -261,6 +310,8 @@ __device__ __forceinline__ void gemv_body(GEMV_ARGS) {
     if (tid < chunks) xsum[tid] = xsum_in[tid];
     scale = *scale_in;
     __syncthreads();
+  } else if (PER_THREAD < 0) {
+    scale = quantize_stream<MODE>(input, aux, n, eps, splits, q8, xsum, slots);
   } else {
     scale = quantize_source<MODE, (PER_THREAD > 0 ? PER_THREAD : 1)>(input, aux, n, eps, splits, q8, xsum, slots);
   }
@@ -331,7 +382,9 @@ extern "C" __global__ void __launch_bounds__(THREADS) gemv_attn_residual_wide(GE
 template <int MODE, int PER_THREAD>
 __device__ __forceinline__ void quantize_body(QUANT_ARGS) {
   __shared__ float slots[64];
-  const float scale = quantize_source<MODE, PER_THREAD>(input, aux, n, eps, splits, q8_out, xsum_out, slots);
+  const float scale = PER_THREAD < 0 ? quantize_stream<MODE>(input, aux, n, eps, splits, q8_out, xsum_out, slots)
+                                     : quantize_source<MODE, (PER_THREAD > 0 ? PER_THREAD : 1)>(
+                                           input, aux, n, eps, splits, q8_out, xsum_out, slots);
   if (threadIdx.x == 0) *scale_out = scale;
 }
 
@@ -357,12 +410,13 @@ extern "C" __global__ void __launch_bounds__(RECURRENT_MAX_THREADS) recurrent_st
     float* __restrict__ conv_state, const float* __restrict__ decay, const float* __restrict__ theta,
     const float* __restrict__ skip, float* __restrict__ ssm_state, float* __restrict__ prev_force,
     float* __restrict__ output, int hidden, int state_dim, int head_dim, int conv_taps,
-    float half_dt_min, float half_dt_range) {
+    float half_dt_min, float half_dt_range, int dims) {
   __shared__ float partial[RECURRENT_MAX_THREADS];
-  __shared__ float values[RECURRENT_MAX_THREADS];
+  __shared__ float values[TILE_HEAD];
   __shared__ float coefficients[RECURRENT_MAX_STATE][5];
   const int head = blockIdx.x, tid = threadIdx.x;
-  const int s = tid / head_dim, dim = tid - s * head_dim;
+  const int s = tid / dims, local = tid - s * dims;
+  const int dim = blockIdx.y * dims + local;
   const int c = head * head_dim + dim;
   const float* bcdt = proj + 2 * hidden + head * 3 * state_dim;
   const size_t slot = (size_t)(head * state_dim + s) * head_dim + dim;
@@ -378,7 +432,7 @@ extern "C" __global__ void __launch_bounds__(RECURRENT_MAX_THREADS) recurrent_st
     conv += taps[conv_taps - 1] * incoming;
     for (int k = 0; k < conv_taps - 2; ++k) window[k] = window[k + 1];
     window[conv_taps - 2] = incoming;
-    values[dim] = silu_f(conv);
+    values[local] = silu_f(conv);
   }
   if (tid < state_dim) {
     const float half_dt = half_dt_min + sigmoid_f(bcdt[2 * state_dim + tid]) * half_dt_range;
@@ -393,7 +447,7 @@ extern "C" __global__ void __launch_bounds__(RECURRENT_MAX_THREADS) recurrent_st
     coefficients[tid][4] = magnitude * sn;
   }
   __syncthreads();
-  const float value = values[dim];
+  const float value = values[local];
   const float b = coefficients[s][0], cc = coefficients[s][1], half_dt = coefficients[s][2];
   const float ar = coefficients[s][3], ai = coefficients[s][4];
   const float force = b * value;
@@ -408,7 +462,7 @@ extern "C" __global__ void __launch_bounds__(RECURRENT_MAX_THREADS) recurrent_st
   __syncthreads();
   if (s == 0) {
     float total = 0.0f;
-    for (int k = 0; k < state_dim; ++k) total += partial[k * head_dim + dim];
+    for (int k = 0; k < state_dim; ++k) total += partial[k * dims + local];
     output[c] = (total + skip[c] * value) * sigmoid_f(proj[hidden + c]);
   }
 }
@@ -570,9 +624,13 @@ __device__ __forceinline__ void quantize_tile_body(QUANT_TILE_ARGS) {
   __shared__ float slots[64];
   const int t = blockIdx.x;
   const int chunks = (n + 63) >> 6;
-  const float scale = quantize_source<MODE, PER_THREAD>(
-      input + (size_t)t * in_stride, aux, n, eps, splits, q8_out + (size_t)t * chunks * 64, xsum_out + (size_t)t * chunks,
-      slots);
+  const float scale =
+      PER_THREAD < 0
+          ? quantize_stream<MODE>(input + (size_t)t * in_stride, aux, n, eps, splits,
+                                  q8_out + (size_t)t * chunks * 64, xsum_out + (size_t)t * chunks, slots)
+          : quantize_source<MODE, (PER_THREAD > 0 ? PER_THREAD : 1)>(
+                input + (size_t)t * in_stride, aux, n, eps, splits, q8_out + (size_t)t * chunks * 64,
+                xsum_out + (size_t)t * chunks, slots);
   if (threadIdx.x == 0) scale_out[t] = scale;
 }
 
@@ -988,10 +1046,46 @@ __device__ __forceinline__ void select_digit(
   __syncthreads();
 }
 
-extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_token(
+extern "C" __global__ void __launch_bounds__(BOUND_GROUP) logit_bounds(
     const float* __restrict__ logits, const float* __restrict__ temperature, const float* __restrict__ penalty,
-    const float* __restrict__ inverse_penalty, u8* __restrict__ seen, const long long* __restrict__ top_k,
-    const float* __restrict__ uniform, long long* __restrict__ token, int vocab) {
+    const float* __restrict__ inverse_penalty, const u8* __restrict__ seen, float* __restrict__ bounds, int vocab) {
+  __shared__ float slots[32];
+  const int i = blockIdx.x * BOUND_GROUP + threadIdx.x;
+  const float score =
+      i < vocab ? sampling_score(logits, seen, i, 1.0f / *temperature, *penalty, *inverse_penalty) : NEG_INF;
+  const float best = block_max(score, slots);
+  if (threadIdx.x == 0) bounds[blockIdx.x] = best;
+}
+
+__device__ __forceinline__ int scan_base(const int* __restrict__ groups, bool restricted, int j) {
+  return restricted ? groups[j >> 4] * BOUND_GROUP + ((j & 15) << 2) : j << 2;
+}
+
+__device__ __forceinline__ void scan_batch(
+    const float* __restrict__ logits, const u8* __restrict__ seen, const int* __restrict__ groups, bool restricted,
+    int j, int total_vecs, int vocab, float inverse_temperature, float penalty, float inverse_penalty,
+    int* bases, float (*batch)[4]) {
+#pragma unroll
+  for (int u = 0; u < SAMPLE_BATCH; ++u) {
+    const int slot = j + u * SAMPLE_THREADS;
+    bases[u] = slot < total_vecs ? scan_base(groups, restricted, slot) : -1;
+  }
+#pragma unroll
+  for (int u = 0; u < SAMPLE_BATCH; ++u) {
+    if (bases[u] >= 0) {
+      sampling_scores(logits, seen, bases[u], vocab, inverse_temperature, penalty, inverse_penalty, batch[u]);
+    } else {
+#pragma unroll
+      for (int e = 0; e < 4; ++e) batch[u][e] = NEG_INF;
+    }
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_token(
+    const float* __restrict__ logits, const float* __restrict__ bounds, const float* __restrict__ temperature,
+    const float* __restrict__ penalty, const float* __restrict__ inverse_penalty, u8* __restrict__ seen,
+    const long long* __restrict__ top_k, const float* __restrict__ uniform, long long* __restrict__ token,
+    int vocab) {
   __shared__ unsigned int histogram[SAMPLE_WARPS * 128];
   __shared__ unsigned int suffix[256];
   __shared__ unsigned int totals[256];
@@ -1002,6 +1096,10 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_token(
   __shared__ unsigned int candidate_key[2][SAMPLE_THREADS];
   __shared__ int candidate_index[2][SAMPLE_THREADS];
   __shared__ int pick_index[MAX_TOPK];
+  __shared__ int groups_shared[SAMPLE_GROUPS];
+  __shared__ int group_count;
+  __shared__ int bucket_counts[BOUND_BUCKETS];
+  __shared__ float span_shared;
   __shared__ float slots[64];
   __shared__ float warp_totals[SAMPLE_WARPS];
   __shared__ float cdf[SAMPLE_THREADS];
@@ -1011,41 +1109,69 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_token(
   const float inverse_temperature = 1.0f / *temperature;
   const float pen = *penalty, inv_pen = *inverse_penalty;
   const int k = max(1, min((int)(*top_k), min(MAX_TOPK, vocab)));
-  const int stride = SAMPLE_THREADS * 4;
+  const int total_groups = (vocab + BOUND_GROUP - 1) / BOUND_GROUP;
   const float deltas[SAMPLE_DELTAS] = {4.0f, 8.0f, 12.0f, 16.0f, 24.0f, 32.0f};
   unsigned int prefix = 0u;
   unsigned int resolved = 0u;
   int remaining = k;
   int shift = 32;
-  float scores[SAMPLE_BATCH][4];
+  float batch[SAMPLE_BATCH][4];
+  int bases[SAMPLE_BATCH];
+  float bound = NEG_INF;
+  for (int g = tid; g < total_groups; g += SAMPLE_THREADS) bound = fmaxf(bound, bounds[g]);
+  const float peak_score = block_max(bound, slots);
   if (tid == 0) {
+    group_count = 0;
     definite_shared = 0;
     candidate_shared[0] = 0;
     candidate_shared[1] = 0;
     chosen_shared = -1;
     threshold_shared = NEG_INF;
   }
-  float local_peak = NEG_INF;
-  for (int base = tid * 4; base < vocab; base += stride * SAMPLE_BATCH) {
-#pragma unroll
-    for (int b = 0; b < SAMPLE_BATCH; ++b) {
-      sampling_scores(logits, seen, base + b * stride, vocab, inverse_temperature, pen, inv_pen, scores[b]);
-#pragma unroll
-      for (int e = 0; e < 4; ++e) local_peak = fmaxf(local_peak, scores[b][e]);
+  if (tid < BOUND_BUCKETS) bucket_counts[tid] = 0;
+  __syncthreads();
+  for (int g = tid; g < total_groups; g += SAMPLE_THREADS) {
+    const float gap = peak_score - bounds[g];
+    const int bucket = gap <= 1.0f ? 0 : min(BOUND_BUCKETS - 1, (int)ceilf(log2f(gap)));
+    atomicAdd(&bucket_counts[bucket], 1);
+  }
+  __syncthreads();
+  if (tid == 0) {
+    int cumulative = 0;
+    int chosen = BOUND_BUCKETS - 1;
+    for (int b = 0; b < BOUND_BUCKETS; ++b) {
+      cumulative += bucket_counts[b];
+      if (cumulative >= k) {
+        chosen = b;
+        break;
+      }
+    }
+    span_shared = chosen == 0 ? 1.0f : exp2f((float)chosen);
+  }
+  __syncthreads();
+  const float span = span_shared;
+  const float floor_score = peak_score - span;
+  for (int g = tid; g < total_groups; g += SAMPLE_THREADS) {
+    if (bounds[g] >= floor_score) {
+      const int slot = atomicAdd(&group_count, 1);
+      if (slot < SAMPLE_GROUPS) groups_shared[slot] = g;
     }
   }
-  const float peak_score = block_max(local_peak, slots);
+  __syncthreads();
+  const bool restricted = group_count <= SAMPLE_GROUPS && group_count * BOUND_GROUP * 2 <= vocab;
+  const int total_vecs = restricted ? group_count * (BOUND_GROUP / 4) : (vocab + 3) >> 2;
   int counts[SAMPLE_DELTAS];
 #pragma unroll
   for (int d = 0; d < SAMPLE_DELTAS; ++d) counts[d] = 0;
-  for (int base = tid * 4; base < vocab; base += stride * SAMPLE_BATCH) {
+  for (int j = tid; j < total_vecs; j += SAMPLE_THREADS * SAMPLE_BATCH) {
+    scan_batch(logits, seen, groups_shared, restricted, j, total_vecs, vocab, inverse_temperature, pen, inv_pen,
+               bases, batch);
 #pragma unroll
-    for (int b = 0; b < SAMPLE_BATCH; ++b) {
-      sampling_scores(logits, seen, base + b * stride, vocab, inverse_temperature, pen, inv_pen, scores[b]);
+    for (int u = 0; u < SAMPLE_BATCH; ++u) {
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
 #pragma unroll
-        for (int d = 0; d < SAMPLE_DELTAS; ++d) counts[d] += scores[b][e] >= peak_score - deltas[d] ? 1 : 0;
+        for (int d = 0; d < SAMPLE_DELTAS; ++d) counts[d] += batch[u][e] >= peak_score - deltas[d] ? 1 : 0;
       }
     }
   }
@@ -1057,6 +1183,7 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_token(
   __syncthreads();
   if (tid == 0) {
     for (int d = SAMPLE_DELTAS - 1; d >= 0; --d) {
+      if (restricted && deltas[d] > span) continue;
       int total = 0;
       for (int w = 0; w < SAMPLE_WARPS; ++w) total += delta_counts[d][w];
       if (total >= k && total <= SAMPLE_THREADS) {
@@ -1073,15 +1200,16 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_token(
       shift -= 8;
       for (int bin = tid; bin < SAMPLE_WARPS * 128; bin += SAMPLE_THREADS) histogram[bin] = 0u;
       __syncthreads();
-      for (int base = tid * 4; base < vocab; base += stride * SAMPLE_BATCH) {
+      for (int j = tid; j < total_vecs; j += SAMPLE_THREADS * SAMPLE_BATCH) {
+        scan_batch(logits, seen, groups_shared, restricted, j, total_vecs, vocab, inverse_temperature, pen, inv_pen,
+                   bases, batch);
 #pragma unroll
-        for (int b = 0; b < SAMPLE_BATCH; ++b) {
-          sampling_scores(logits, seen, base + b * stride, vocab, inverse_temperature, pen, inv_pen, scores[b]);
+        for (int u = 0; u < SAMPLE_BATCH; ++u) {
+          if (bases[u] < 0) continue;
 #pragma unroll
           for (int e = 0; e < 4; ++e) {
-            const int i = base + b * stride + e;
-            const unsigned int key = sortable_key(scores[b][e]);
-            if (i < vocab && (key & resolved) == prefix) count_key(histogram, warp, (key >> shift) & 0xffu);
+            const unsigned int key = sortable_key(batch[u][e]);
+            if (bases[u] + e < vocab && (key & resolved) == prefix) count_key(histogram, warp, (key >> shift) & 0xffu);
           }
         }
       }
@@ -1094,36 +1222,38 @@ extern "C" __global__ void __launch_bounds__(SAMPLE_THREADS) sample_token(
     }
   }
   int phase = 0;
-  for (int base = tid * 4; base < vocab; base += stride * SAMPLE_BATCH) {
+  for (int j = tid; j < total_vecs; j += SAMPLE_THREADS * SAMPLE_BATCH) {
+    scan_batch(logits, seen, groups_shared, restricted, j, total_vecs, vocab, inverse_temperature, pen, inv_pen,
+               bases, batch);
 #pragma unroll
-    for (int b = 0; b < SAMPLE_BATCH; ++b) {
-      sampling_scores(logits, seen, base + b * stride, vocab, inverse_temperature, pen, inv_pen, scores[b]);
+    for (int u = 0; u < SAMPLE_BATCH; ++u) {
+      if (bases[u] < 0) continue;
 #pragma unroll
       for (int e = 0; e < 4; ++e) {
-        const int i = base + b * stride + e;
-        if (i >= vocab) continue;
-        const unsigned int key = sortable_key(scores[b][e]);
-        if (filtered) {
-          if (scores[b][e] >= threshold) {
-            const int slot = atomicAdd(&candidate_shared[0], 1);
-            if (slot < SAMPLE_THREADS) {
-              candidate_key[0][slot] = key;
-              candidate_index[0][slot] = i;
-            }
-          }
-          continue;
-        }
-        const unsigned int masked = key & resolved;
-        if (masked > prefix) {
-          const int slot = atomicAdd(&definite_shared, 1);
-          if (slot < MAX_TOPK) pick_index[slot] = i;
-        } else if (masked == prefix) {
+      const int i = bases[u] + e;
+      if (i >= vocab) continue;
+      const unsigned int key = sortable_key(batch[u][e]);
+      if (filtered) {
+        if (batch[u][e] >= threshold) {
           const int slot = atomicAdd(&candidate_shared[0], 1);
           if (slot < SAMPLE_THREADS) {
             candidate_key[0][slot] = key;
             candidate_index[0][slot] = i;
           }
         }
+        continue;
+      }
+      const unsigned int masked = key & resolved;
+      if (masked > prefix) {
+        const int slot = atomicAdd(&definite_shared, 1);
+        if (slot < MAX_TOPK) pick_index[slot] = i;
+      } else if (masked == prefix) {
+        const int slot = atomicAdd(&candidate_shared[0], 1);
+        if (slot < SAMPLE_THREADS) {
+          candidate_key[0][slot] = key;
+          candidate_index[0][slot] = i;
+        }
+      }
       }
     }
   }

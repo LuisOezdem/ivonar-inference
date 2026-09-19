@@ -46,14 +46,55 @@ def test_fused_decoder_matches_the_one_pass_forward_on_cpu() -> None:
 
 
 @torch.no_grad()
-def test_cpu_decoder_keeps_the_module_projections() -> None:
+def test_fused_projections_share_memory_with_the_modules() -> None:
     torch.manual_seed(4)
     model = tiny_model(seed=4)
     ids = torch.randint(2, 300, (9,)).tolist()
     decoder = StaticDecoder(model, max_len=32, device="cpu")
-    assert decoder.ffn_projections == {} and decoder.recurrent_projections == {}
+    assert set(decoder.ffn_projections) == {0, 1, 2} and set(decoder.recurrent_projections) == {0, 2}
+    fused = decoder.ffn_projections[0].weight
+    gate = model.blocks[0].ffn.gate_proj.cached_runtime_weight("cpu")
+    up = model.blocks[0].ffn.up_proj.cached_runtime_weight("cpu")
+    assert gate.data_ptr() == fused.data_ptr()
+    assert up.data_ptr() == fused.data_ptr() + gate.numel() * gate.element_size()
     predicted, reference = _teacher_forced(model, decoder, ids, split=5)
     torch.testing.assert_close(predicted, reference, rtol=1e-3, atol=1e-3)
+
+
+@torch.no_grad()
+def test_half_precision_weights_on_the_cpu_give_the_same_answers() -> None:
+    from ivonar_inference.loader import materialize_weights
+    from ivonar_inference.quantization import quantized_linear
+
+    torch.manual_seed(6)
+    model = tiny_model(seed=6)
+    projection = model.blocks[0].ffn.gate_proj
+    full = projection.cached_runtime_weight("cpu")
+    half = full.half()
+    assert torch.equal(half.float(), full)
+    for rows in (1, 7):
+        x = torch.randn(rows, full.shape[1])
+        torch.testing.assert_close(
+            quantized_linear(x, half, projection.bias), quantized_linear(x, full, projection.bias), rtol=2e-3, atol=2e-3
+        )
+    ids = torch.randint(2, 300, (12,)).tolist()
+    reference_decoder = StaticDecoder(model, max_len=32, device="cpu")
+    expected, reference = _teacher_forced(model, reference_decoder, ids, split=6)
+    halved = tiny_model(seed=6)
+    materialize_weights(halved, torch.float16)
+    predicted, _ = _teacher_forced(halved, StaticDecoder(halved, max_len=32, device="cpu"), ids, split=6)
+    torch.testing.assert_close(predicted, reference, rtol=1e-2, atol=1e-2)
+    assert torch.equal(predicted.argmax(-1), expected.argmax(-1))
+
+
+def test_the_cpu_precision_follows_the_measured_speed(monkeypatch) -> None:
+    from ivonar_inference import quantization
+
+    monkeypatch.setattr(quantization, "_cpu_half", True)
+    assert quantization.runtime_dtype("cpu") == torch.float16
+    monkeypatch.setattr(quantization, "_cpu_half", False)
+    assert quantization.runtime_dtype("cpu") == torch.float32
+    assert quantization.runtime_dtype("cuda") == torch.float16
 
 
 @torch.no_grad()

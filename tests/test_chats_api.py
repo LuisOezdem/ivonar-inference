@@ -72,6 +72,33 @@ def test_bad_turns_are_rejected_and_nothing_is_stored(client: TestClient) -> Non
     assert client.get(f"/api/chats/{chat_id}").json()["messages"] == []
 
 
+def test_regenerate_replaces_the_last_answer(client: TestClient) -> None:
+    chat_id = client.post("/api/chats").json()["id"]
+    with client.stream("POST", f"/api/chats/{chat_id}/messages", json={"content": "Where is Paris?"}) as response:
+        _events(response)
+    with client.stream("POST", f"/api/chats/{chat_id}/regenerate", json={}) as response:
+        assert response.status_code == 200
+        events = _events(response)
+    assert "".join(event.get("delta", "") for event in events) == ANSWER
+    assert events[-1]["done"] is True
+    prompt = fake_stream.calls[-1]["prompt"]
+    assert prompt.endswith("<|im_start|><|user|>Where is Paris?<|im_end|><|im_start|><|assistant|>")
+    assert ANSWER not in prompt
+    messages = client.get(f"/api/chats/{chat_id}").json()["messages"]
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert messages[1]["content"] == ANSWER
+
+
+def test_regenerate_checks_before_it_drops_anything(client: TestClient) -> None:
+    chat_id = client.post("/api/chats").json()["id"]
+    assert client.post(f"/api/chats/{chat_id}/regenerate").status_code == 409
+    assert client.post("/api/chats/missing/regenerate").status_code == 404
+    with client.stream("POST", f"/api/chats/{chat_id}/messages", json={"content": "Where is Paris?"}) as response:
+        _events(response)
+    assert client.post(f"/api/chats/{chat_id}/regenerate", json={"temperature": 0}).status_code == 400
+    assert len(client.get(f"/api/chats/{chat_id}").json()["messages"]) == 2
+
+
 def test_app_without_store_has_no_chat_routes(engine: Engine) -> None:
     client = TestClient(create_app(engine))
     assert client.get("/api/chats").status_code == 404

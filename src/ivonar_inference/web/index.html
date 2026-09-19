@@ -204,6 +204,7 @@ textarea.control { resize: vertical; font-family: var(--font); line-height: 1.45
 .msg:hover .tools, .msg:focus-within .tools { opacity: 1; }
 .tool-btn { font-size: 11.5px; color: var(--text-faint); padding: 3px 7px; border-radius: 5px; }
 .tool-btn:hover { background: var(--bg-hover); color: var(--text); }
+.msg:has(~ .msg) [data-regen] { display: none; }
 .stamp { font-size: 11.5px; color: var(--text-faint); margin-top: 5px; }
 .cursor { display: inline-block; width: 7px; height: 15px; background: var(--accent); vertical-align: -2px; animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
@@ -219,6 +220,17 @@ textarea.control { resize: vertical; font-family: var(--font); line-height: 1.45
   background: var(--bg-raised); font-size: 13px; color: var(--text-dim); transition: border-color .12s ease;
 }
 .starter:hover { border-color: var(--accent); color: var(--text); }
+
+.setup { max-width: 440px; margin: 0 auto; padding: 56px 20px 20px; text-align: center; color: var(--text-dim); }
+.setup h2 { margin: 14px 0 6px; font-size: 19px; color: var(--text); font-weight: 620; }
+.setup p { margin: 0 auto 18px; font-size: 13.5px; }
+.setup .hint { margin-top: 12px; overflow-wrap: anywhere; }
+.setup .detail { font-size: 12px; color: var(--text-faint); min-height: 1.5em; overflow-wrap: anywhere; }
+.setup .error { color: var(--danger); font-size: 13px; overflow-wrap: anywhere; }
+.progress { height: 6px; border-radius: 3px; background: var(--bg-active); overflow: hidden; margin: 20px 0 9px; }
+.progress span { display: block; height: 100%; width: 0; background: var(--accent); transition: width .25s ease; }
+.progress.busy span { width: 35%; animation: sweep 1.2s ease-in-out infinite; }
+@keyframes sweep { 0% { transform: translateX(-100%); } 100% { transform: translateX(290%); } }
 
 #jump {
   position: absolute; right: 22px; bottom: 14px; width: 32px; height: 32px; border-radius: 50%;
@@ -406,7 +418,7 @@ const STARTERS = [
 
 const $ = (id) => document.getElementById(id);
 const state = {
-  chats: [], current: null, messages: [], status: null,
+  chats: [], current: null, messages: [], status: null, ready: true, watching: false,
   streaming: false, controller: null, filter: "", pinned: true,
 };
 
@@ -473,9 +485,34 @@ async function api(path, options = {}) {
   return response.status === 204 ? null : response.json();
 }
 
+function setComposer(enabled) {
+  $("input").disabled = !enabled;
+  $("send").disabled = !enabled;
+  $("input").placeholder = enabled ? "Send a message" : "Download a model to start chatting";
+}
+
 async function loadStatus() {
   state.status = await api("/api/status");
   const s = state.status;
+  state.ready = !!s.ready;
+  $("sys").value = s.system || "";
+  $("temp").value = s.defaults.temperature;
+  $("topk").value = s.defaults.top_k;
+  $("maxtok").value = s.defaults.max_tokens;
+  $("rep").value = s.defaults.repetition_penalty;
+  setComposer(state.ready);
+  if (!state.ready) {
+    $("model-pill").innerHTML = "<b>no model yet</b>";
+    $("device-line").textContent = "no model installed";
+    $("device-line").title = "";
+    $("brand-sub").textContent = "setup";
+    $("model-select").innerHTML = "<option>none</option>";
+    $("model-select").disabled = true;
+    updateContextBar();
+    const phase = s.download ? s.download.phase : "idle";
+    if (phase === "downloading" || phase === "loading") watchDownload();
+    return;
+  }
   const backend = s.backend === "ternary" ? " · ternary kernels" : "";
   $("model-pill").innerHTML = `<b>${esc(s.model)}</b> · ${esc(s.device)}${backend}${s.graph ? " · graph" : ""}`;
   $("device-line").textContent = `${s.device}${s.backend === "ternary" ? " · ternary" : ""}${s.graph ? " · graph" : ""} · ${s.context_tokens} ctx`;
@@ -492,12 +529,120 @@ async function loadStatus() {
     select.append(option);
   }
   select.disabled = names.length < 2;
-  $("sys").value = s.system || "";
-  $("temp").value = s.defaults.temperature;
-  $("topk").value = s.defaults.top_k;
-  $("maxtok").value = s.defaults.max_tokens;
-  $("rep").value = s.defaults.repetition_penalty;
   updateContextBar();
+}
+
+const megabytes = (bytes) => (bytes / 1e6).toFixed(1);
+
+function downloadDetail(job) {
+  if (!job.done && !job.total) return "Connecting to Hugging Face…";
+  const amount = job.total ? `${megabytes(job.done)} of ${megabytes(job.total)} MB` : `${megabytes(job.done)} MB`;
+  return job.file ? `${amount} · ${job.file}` : amount;
+}
+
+function setupNode() {
+  const s = state.status || {};
+  const job = s.download || { phase: "idle" };
+  const catalog = s.catalog || { title: "Ivonar Nano", size_mb: 100, folder: "" };
+  const node = document.createElement("div");
+  node.className = "setup";
+  node.dataset.phase = job.phase;
+  const logo = '<img class="logo" style="width:44px;height:44px;margin:0 auto" src="/assets/ivonar-logo.png" alt="">';
+  if (job.phase === "downloading") {
+    const share = job.total ? Math.min(1, job.done / job.total) : 0;
+    node.innerHTML = `${logo}<h2>Downloading ${esc(catalog.title)}</h2>
+      <div class="progress${job.total ? "" : " busy"}"><span style="width:${(share * 100).toFixed(1)}%"></span></div>
+      <div class="detail">${esc(downloadDetail(job))}</div>`;
+  } else if (job.phase === "loading") {
+    node.innerHTML = `${logo}<h2>Preparing the model</h2>
+      <div class="progress busy"><span></span></div>
+      <div class="detail">The first start compiles the GPU kernels, which takes a few seconds.</div>`;
+  } else if (job.phase === "error") {
+    const heading = job.failed === "loading" ? "The model could not be loaded" : "The download did not finish";
+    node.innerHTML = `${logo}<h2>${heading}</h2>
+      <p class="error">${esc(job.error || "Unknown error")}</p>
+      <button class="btn primary" data-download="1">Try again</button>`;
+  } else {
+    node.innerHTML = `${logo}<h2>Welcome to Ivonar</h2>
+      <p>Ivonar runs entirely on this computer. Download the model once to start chatting.</p>
+      <button class="btn primary" data-download="1">Download ${esc(catalog.title)}</button>
+      <div class="hint">About ${catalog.size_mb} MB from Hugging Face, saved to ${esc(catalog.folder)}. A model folder copied there starts by itself.</div>`;
+  }
+  return node;
+}
+
+function drawSetup() {
+  const job = (state.status && state.status.download) || { phase: "idle" };
+  const current = document.querySelector(".setup");
+  if (current && current.dataset.phase === job.phase && job.phase === "downloading") {
+    const bar = current.querySelector(".progress");
+    bar.classList.toggle("busy", !job.total);
+    bar.querySelector("span").style.width = `${job.total ? (Math.min(1, job.done / job.total) * 100).toFixed(1) : 0}%`;
+    current.querySelector(".detail").textContent = downloadDetail(job);
+    return;
+  }
+  drawThread();
+}
+
+async function startDownload() {
+  try {
+    state.status.download = await api("/api/download", { method: "POST" });
+  } catch (error) {
+    toast(error.message);
+    await loadStatus();
+    drawThread();
+    return;
+  }
+  drawSetup();
+  watchDownload();
+}
+
+function watchDownload() {
+  if (state.watching) return;
+  state.watching = true;
+  const tick = async () => {
+    let job;
+    try {
+      job = await api("/api/download");
+    } catch (error) {
+      setTimeout(tick, 1500);
+      return;
+    }
+    state.status.download = job;
+    if (job.phase === "downloading" || job.phase === "loading") {
+      drawSetup();
+      setTimeout(tick, 400);
+      return;
+    }
+    state.watching = false;
+    if (job.phase === "ready") {
+      await loadStatus();
+      await loadChats();
+      drawThread();
+      toast("Ivonar is ready");
+      $("input").focus();
+      return;
+    }
+    drawSetup();
+  };
+  tick();
+}
+
+async function checkForModels() {
+  if (state.watching || state.streaming || $("settings").open) return;
+  let s;
+  try { s = await api("/api/status"); } catch (error) { return; }
+  const job = s.download || { phase: "idle" };
+  if (!s.ready) {
+    state.status = s;
+    if (job.phase === "downloading" || job.phase === "loading") { watchDownload(); return; }
+    const retry = job.phase === "idle" || (job.phase === "error" && job.failed === "downloading");
+    if (s.models.length && retry) await startDownload();
+    return;
+  }
+  const wasReady = state.ready;
+  await loadStatus();
+  if (!wasReady) { await loadChats(); drawThread(); }
 }
 
 async function saveSettings() {
@@ -526,6 +671,7 @@ async function switchModel(name) {
   } catch (error) {
     toast(error.message);
     await loadStatus();
+    if (!state.ready) drawThread();
   }
 }
 
@@ -644,6 +790,10 @@ function messageNode(role, html, stamp) {
 function drawThread() {
   const thread = $("thread");
   thread.innerHTML = "";
+  if (!state.ready) {
+    thread.append(setupNode());
+    return;
+  }
   const visible = state.messages.filter((m) => m.role !== "system");
   if (!visible.length) {
     const empty = document.createElement("div");
@@ -687,6 +837,7 @@ function updateContextBar(used) {
 
 async function send(text) {
   if (state.streaming) return;
+  if (!state.ready) { toast("Download a model first"); return; }
   const content = (text !== undefined ? text : $("input").value).trim();
   if (!content) return;
   if (!state.current) { const chat = await api("/api/chats", { method: "POST", body: JSON.stringify({ title: "New chat" }) }); await loadChats(chat.id); }
@@ -695,7 +846,10 @@ async function send(text) {
   state.messages.push({ role: "user", content });
   drawThread();
   pin();
+  await streamAnswer("messages", { content });
+}
 
+async function streamAnswer(action, body) {
   const node = messageNode("assistant", '<span class="cursor"></span>');
   $("thread").append(node);
   const target = node.querySelector(".content");
@@ -706,10 +860,10 @@ async function send(text) {
   let finished = null;
   state.controller = new AbortController();
   try {
-    const response = await fetch(`/api/chats/${state.current}/messages`, {
+    const response = await fetch(`/api/chats/${state.current}/${action}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(body),
       signal: state.controller.signal,
     });
     if (!response.ok) {
@@ -730,6 +884,7 @@ async function send(text) {
         const line = event.trim();
         if (!line.startsWith("data:")) continue;
         const payload = JSON.parse(line.slice(5));
+        if (payload.error) throw new Error(payload.error);
         if (payload.delta) {
           answer += payload.delta;
           target.innerHTML = render(answer) + '<span class="cursor"></span>';
@@ -776,12 +931,12 @@ function setStreaming(active) {
 }
 
 async function regenerate() {
-  if (state.streaming) return;
-  let last = null;
-  for (let index = state.messages.length - 1; index >= 0; index -= 1) {
-    if (state.messages[index].role === "user") { last = state.messages[index].content; break; }
-  }
-  if (last) await send(last);
+  if (state.streaming || !state.ready || !state.current) return;
+  while (state.messages.length && state.messages[state.messages.length - 1].role === "assistant") state.messages.pop();
+  if (!state.messages.some((message) => message.role === "user")) return;
+  drawThread();
+  pin();
+  await streamAnswer("regenerate", {});
 }
 
 function autosize() {
@@ -817,6 +972,9 @@ $("theme-toggle").onclick = () => {
   toast(`Theme: ${next}`);
 };
 
+setInterval(() => { if (!state.ready) checkForModels(); }, 2500);
+window.addEventListener("focus", checkForModels);
+
 $("send").onclick = () => { if (state.streaming) state.controller && state.controller.abort(); else send(); };
 $("input").addEventListener("input", autosize);
 window.addEventListener("resize", autosize);
@@ -838,6 +996,7 @@ document.addEventListener("click", (event) => {
     navigator.clipboard.writeText(copyMsg.closest(".body").querySelector(".content").innerText).then(() => toast("Message copied"));
     return;
   }
+  if (event.target.closest("[data-download]")) { startDownload(); return; }
   if (event.target.closest("[data-regen]")) { regenerate(); return; }
   const starter = event.target.closest("[data-starter]");
   if (starter) { send(starter.dataset.starter); return; }

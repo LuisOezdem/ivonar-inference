@@ -134,7 +134,7 @@ def test_sample_token_follows_the_top_k_distribution() -> None:
     torch.manual_seed(21)
     _, served = _reference_and_served(_config(16, 4, 3, 8, 32), seed=21)
     decoder = KernelDecoder(served, max_len=32, device="cuda", sampling=True, max_top_k=16)
-    assert decoder._sample_launch is not None
+    assert decoder._sample_launches
     logits = torch.randn(300, device="cuda") * 3
     decoder.logits.copy_(logits.unsqueeze(0))
     decoder.configure_sampling(temperature=0.7, top_k=8, repetition_penalty=1.0)

@@ -9,7 +9,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from .download import DEFAULT_MODEL, DEFAULT_SIZE_MB, DEFAULT_TITLE, PullJob
 from .engine import Engine, GenerationSettings
+from .paths import user_models_dir
 from .protocol import (
     ChatCompletionRequest,
     chunk_payload,
@@ -20,8 +22,9 @@ from .protocol import (
 from .registry import DEFAULT_SYSTEM, ModelRegistry
 from .store import ChatStore
 
-
 LOGO_PATH = "/assets/ivonar-logo.png"
+NO_MODEL = "No model is installed yet. Open the chat page and click Download, or run 'ivonar pull'."
+UNBOUNDED_CONTEXT = 1 << 20
 
 
 def _sse(payload: object) -> str:
@@ -48,8 +51,7 @@ class SettingsUpdate(BaseModel):
     repetition_penalty: float | None = Field(default=None, gt=0, le=5)
 
 
-class ChatTurn(BaseModel):
-    content: str = Field(min_length=1)
+class TurnSettings(BaseModel):
     system: str | None = None
     temperature: float | None = None
     top_k: int | None = None
@@ -68,25 +70,45 @@ class ChatTurn(BaseModel):
         )
 
 
+class ChatTurn(TurnSettings):
+    content: str = Field(min_length=1)
+
+
 def create_app(
-    engine: Engine,
+    engine: Engine | None = None,
     default_system: str | None = None,
     store: ChatStore | None = None,
     registry: ModelRegistry | None = None,
+    pull: PullJob | None = None,
 ) -> FastAPI:
+    """The chat page and the API over one engine, or over a registry that may still be waiting for a model.
+
+    With a ``pull`` job the page offers to download the default release while
+    no model is installed, and the server loads it once the download is done.
+    """
+
     from . import __version__
 
     app = FastAPI(title="Ivonar inference", version=__version__)
     state = {"system": DEFAULT_SYSTEM if default_system is None else default_system}
 
-    def active() -> Engine:
+    def active() -> Engine | None:
         return registry.engine if registry is not None else engine
 
-    def defaults() -> GenerationSettings:
-        return active().defaults
+    def require() -> Engine:
+        current = active()
+        if current is None:
+            raise HTTPException(status_code=503, detail=NO_MODEL)
+        return current
+
+    def base_settings() -> GenerationSettings:
+        current = active()
+        if current is not None:
+            return current.defaults
+        return registry.defaults if registry is not None else GenerationSettings()
 
     def prepared(messages: Sequence[dict[str, str]], settings: GenerationSettings) -> GenerationSettings:
-        current = active()
+        current = require()
         try:
             checked = settings.validated(current.info.context_tokens)
             current.fit_messages(messages, checked)
@@ -102,24 +124,42 @@ def create_app(
 
     def status() -> dict[str, object]:
         current = active()
-        info = current.info
-        return {
+        settings = base_settings()
+        payload: dict[str, object] = {
             "status": "ok",
-            "model": info.model_id,
-            "device": info.device,
-            "backend": info.backend,
-            "graph": info.graph,
-            "context_tokens": info.context_tokens,
+            "ready": current is not None,
+            "model": None,
+            "device": registry.device if registry is not None else None,
+            "backend": None,
+            "graph": False,
+            "context_tokens": 0,
             "system": state["system"],
             "defaults": {
-                "temperature": current.defaults.temperature,
-                "top_k": current.defaults.top_k,
-                "max_tokens": current.defaults.max_tokens,
-                "repetition_penalty": current.defaults.repetition_penalty,
+                "temperature": settings.temperature,
+                "top_k": settings.top_k,
+                "max_tokens": settings.max_tokens,
+                "repetition_penalty": settings.repetition_penalty,
             },
             "models": [entry.as_dict() for entry in registry.entries()] if registry is not None else [],
             "chats": store is not None,
+            "download": pull.snapshot() if pull is not None else None,
+            "catalog": {
+                "name": pull.name if pull is not None else DEFAULT_MODEL,
+                "title": DEFAULT_TITLE,
+                "size_mb": DEFAULT_SIZE_MB,
+                "folder": str(user_models_dir()),
+            },
         }
+        if current is not None:
+            info = current.info
+            payload.update(
+                model=info.model_id,
+                device=info.device,
+                backend=info.backend,
+                graph=info.graph,
+                context_tokens=info.context_tokens,
+            )
+        return payload
 
     @app.get("/health")
     def health() -> dict[str, object]:
@@ -132,42 +172,61 @@ def create_app(
     @app.post("/api/settings")
     def update_settings(body: SettingsUpdate) -> dict[str, object]:
         current = active()
+        base = base_settings()
         if body.system is not None:
             state["system"] = body.system.strip()
         merged = GenerationSettings(
-            max_tokens=body.max_tokens if body.max_tokens is not None else current.defaults.max_tokens,
-            temperature=body.temperature if body.temperature is not None else current.defaults.temperature,
-            top_k=body.top_k if body.top_k is not None else current.defaults.top_k,
-            repetition_penalty=(
-                body.repetition_penalty if body.repetition_penalty is not None else current.defaults.repetition_penalty
-            ),
-            stop=current.defaults.stop,
+            max_tokens=body.max_tokens if body.max_tokens is not None else base.max_tokens,
+            temperature=body.temperature if body.temperature is not None else base.temperature,
+            top_k=body.top_k if body.top_k is not None else base.top_k,
+            repetition_penalty=body.repetition_penalty if body.repetition_penalty is not None else base.repetition_penalty,
+            stop=base.stop,
         )
         try:
-            current.defaults = merged.validated(current.info.context_tokens)
+            checked = merged.validated(current.info.context_tokens if current is not None else UNBOUNDED_CONTEXT)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if current is not None:
+            current.defaults = checked
         if registry is not None:
-            registry.defaults = current.defaults
+            registry.defaults = checked
             registry.system = state["system"]
         return status()
+
+    @app.get("/api/download")
+    def download_state() -> dict[str, object]:
+        if pull is None:
+            raise HTTPException(status_code=404, detail="this server does not download models")
+        return pull.snapshot()
+
+    @app.post("/api/download", status_code=202)
+    def start_download() -> dict[str, object]:
+        if pull is None:
+            raise HTTPException(status_code=404, detail="this server does not download models")
+        if active() is not None:
+            raise HTTPException(status_code=409, detail="a model is already installed")
+        return pull.start()
 
     @app.get("/v1/models")
     def models() -> dict[str, object]:
         if registry is None:
-            return {"object": "list", "data": [model_card(active().info.model_id)]}
+            current = active()
+            return {"object": "list", "data": [model_card(current.info.model_id)] if current is not None else []}
         return {"object": "list", "data": [model_card(entry.name) for entry in registry.entries()]}
+
+    def switched(name: str) -> Engine:
+        try:
+            return registry.switch(name)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"{name} could not be loaded: {_failure(exc)}") from exc
 
     @app.post("/api/model")
     def switch_model(body: ModelSwitch) -> dict[str, object]:
         if registry is None:
             raise HTTPException(status_code=404, detail="this server serves a single model")
-        try:
-            registry.switch(body.name)
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except (RuntimeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        switched(body.name)
         return status()
 
     @app.get("/", response_class=HTMLResponse)
@@ -185,14 +244,14 @@ def create_app(
 
     @app.post("/v1/chat/completions")
     def chat_completions(request: ChatCompletionRequest):
-        current = active()
-        known = ({entry.name for entry in registry.entries()} if registry is not None else {current.info.model_id}) | {
+        current = require()
+        known = ({entry.name for entry in registry.entries()} if registry is not None else set()) | {
             current.info.model_id
         }
         if request.model is not None and request.model not in known:
             raise HTTPException(status_code=404, detail=f"unknown model: {request.model}")
         if registry is not None and request.model is not None and request.model != registry.current:
-            current = registry.switch(request.model)
+            current = switched(request.model)
         messages = with_system([message.model_dump() for message in request.messages], None)
         settings = prepared(messages, request.settings(current.defaults))
         request_id = completion_id()
@@ -203,7 +262,10 @@ def create_app(
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
-        result = current.complete(messages, settings)
+        try:
+            result = current.complete(messages, settings)
+        except (RuntimeError, MemoryError) as exc:
+            raise HTTPException(status_code=500, detail=_failure(exc)) from exc
         return completion_payload(request_id, model_id, result)
 
     if store is None:
@@ -239,41 +301,74 @@ def create_app(
         store.delete(chat_id)
         return Response(status_code=204)
 
-    @app.post("/api/chats/{chat_id}/messages")
-    def send_message(chat_id: str, turn: ChatTurn):
-        chat = chat_or_404(chat_id)
-        current = active()
-        history = with_system([*chat.messages, {"role": "user", "content": turn.content}], turn.system)
-        settings = prepared(history, turn.settings(current.defaults))
-        store.append(chat_id, "user", turn.content)
+    def stream_answer(current: Engine, chat_id: str, history: list[dict[str, str]], settings) -> StreamingResponse:
         return StreamingResponse(
             _stream_turn(current, store, chat_id, history, settings),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    @app.post("/api/chats/{chat_id}/messages")
+    def send_message(chat_id: str, turn: ChatTurn):
+        chat = chat_or_404(chat_id)
+        current = require()
+        history = with_system([*chat.messages, {"role": "user", "content": turn.content}], turn.system)
+        settings = prepared(history, turn.settings(current.defaults))
+        store.append(chat_id, "user", turn.content)
+        return stream_answer(current, chat_id, history, settings)
+
+    @app.post("/api/chats/{chat_id}/regenerate")
+    def regenerate(chat_id: str, turn: TurnSettings | None = None):
+        chat = chat_or_404(chat_id)
+        current = require()
+        messages = list(chat.messages)
+        while messages and messages[-1]["role"] == "assistant":
+            messages.pop()
+        if not messages:
+            raise HTTPException(status_code=409, detail="there is no message to answer again")
+        turn = turn or TurnSettings()
+        history = with_system(messages, turn.system)
+        settings = prepared(history, turn.settings(current.defaults))
+        store.drop_answer(chat_id)
+        return stream_answer(current, chat_id, history, settings)
+
     return app
+
+
+def _failure(exc: BaseException) -> str:
+    return str(exc) or type(exc).__name__
 
 
 def _stream_chunks(engine: Engine, request_id: str, model_id: str, messages, settings) -> Iterator[str]:
     created = int(time.time())
     yield _sse(chunk_payload(request_id, model_id, created, {"role": "assistant", "content": ""}))
-    for delta in engine.stream(messages, settings):
-        yield _sse(chunk_payload(request_id, model_id, created, {"content": delta}))
+    try:
+        for delta in engine.stream(messages, settings):
+            yield _sse(chunk_payload(request_id, model_id, created, {"content": delta}))
+    except Exception as exc:
+        yield _sse({"error": {"message": _failure(exc), "type": "server_error"}})
+        yield "data: [DONE]\n\n"
+        return
     yield _sse(chunk_payload(request_id, model_id, created, {}, engine.last_generation.finish_reason))
     yield "data: [DONE]\n\n"
 
 
 def _stream_turn(engine: Engine, store: ChatStore, chat_id: str, messages, settings) -> Iterator[str]:
     pieces: list[str] = []
+    failure = None
     try:
         for delta in engine.stream(messages, settings):
             pieces.append(delta)
             yield _sse({"delta": delta})
+    except Exception as exc:
+        failure = _failure(exc)
     finally:
         answer = "".join(pieces)
         if answer.strip():
             store.append(chat_id, "assistant", answer)
+    if failure is not None:
+        yield _sse({"error": failure})
+        return
     result = engine.last_generation
     yield _sse(
         {

@@ -151,7 +151,13 @@ class TernaryTokenizer:
 
     @classmethod
     def load(cls, path: str | Path) -> "TernaryTokenizer":
-        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        try:
+            return cls._from_payload(json.loads(Path(path).read_text(encoding="utf-8")))
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            raise RuntimeError(f"{path} is not an Ivonar tokenizer ({type(exc).__name__}: {exc})") from exc
+
+    @classmethod
+    def _from_payload(cls, payload: dict) -> "TernaryTokenizer":
         tokenizer = cls()
         tokenizer.special_tokens = {str(key): int(value) for key, value in payload["special_tokens"].items()}
         tokenizer.id_to_special = {idx: token for token, idx in tokenizer.special_tokens.items()}

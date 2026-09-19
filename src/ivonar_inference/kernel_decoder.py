@@ -22,14 +22,19 @@ ATTENTION_THREADS = 64
 RECURRENT_MAX_THREADS = 1024
 RECURRENT_MAX_STATE = 512
 SAMPLE_THREADS = 1024
+BOUND_GROUP = 64
 ROW_ALIGNMENT = 16
 DEFAULT_SPLITS = 4
-TARGET_BLOCKS = 48
+TARGET_THREADS = 5120
+WIDE_CHUNKS = NARROW_WIDTH // CHUNK
+HEAD_LANES = 4
+RECURRENT_DIMS = 16
 TILE = 32
 TILE_SPLITS = 1
 TILE_STATE = 16
 TILE_HEAD = 128
 TILE_TAPS = 8
+SELF_CHECK_TOLERANCE = 0.25
 
 
 def kernel_source() -> str:
@@ -37,8 +42,8 @@ def kernel_source() -> str:
 
 
 def _lanes_for(chunks: int, rows: int, max_lanes: int) -> int:
-    lanes = 4
-    while lanes < max_lanes and (chunks > 4 * lanes or rows * lanes < TARGET_BLOCKS * THREADS):
+    lanes = 2
+    while lanes < max_lanes and (rows * lanes < TARGET_THREADS or (chunks > WIDE_CHUNKS and chunks > 2 * lanes)):
         lanes *= 2
     return lanes
 
@@ -84,6 +89,7 @@ class Matrix:
         interleave: bool = False,
         max_lanes: int = 32,
         arena: Arena | None = None,
+        lanes: int = 0,
     ) -> None:
         first = projections[0]
         in_features = int(first.in_features)
@@ -122,7 +128,7 @@ class Matrix:
         self.row_bytes = padded
         self.groups = int(self.scales.shape[1])
         self.chunks = (in_features + CHUNK - 1) // CHUNK
-        self.lanes = _lanes_for(self.chunks, self.rows, max_lanes)
+        self.lanes = lanes if lanes else _lanes_for(self.chunks, self.rows, max_lanes)
 
     @property
     def grid(self) -> int:
@@ -204,14 +210,14 @@ class KernelDecoder(StaticDecoder):
         max_top_k = min(self.max_top_k, SAMPLE_THREADS)
         defines = {"HEAD_DIM": head_dim, "MAX_CHUNKS": max_chunks, "MAX_TOPK": max_top_k, "TILE": TILE}
         self._module = runtime.compile_module(kernel_source(), defines, device)
-        self._sample_launch: Launch | None = None
+        self._sample_launches: list[Launch] = []
         if self.sampling and self.max_top_k <= SAMPLE_THREADS:
-            self._sample_launch = self._sampler(int(config.vocab_size))
+            self._sample_launches = self._sampler(int(config.vocab_size))
         capacity = runtime.driver().persisting_capacity(int(device.index))
         self.arena = Arena(capacity, device) if capacity > 0 else None
         self._persisted_stream: int | None = None
         arena = self.arena
-        self._token_matrix = Matrix([model.token_io.projection], device, arena=arena)
+        self._token_matrix = Matrix([model.token_io.projection], device, arena=arena, lanes=HEAD_LANES)
         self._layer_matrices: list[dict[str, Matrix]] = []
         self._recurrent_tensors: dict[int, tuple[Tensor, ...]] = {}
         self._launches.append(self._embed(self._token_matrix, hidden))
@@ -251,8 +257,12 @@ class KernelDecoder(StaticDecoder):
             self._gemv("gemv_prequant_store", self._token_matrix, None, None, self.logits, prequant=True),
         ]
         self._launches.extend(self._head_launches)
-        if arena is not None and arena.used > 0:
-            runtime.driver().reserve_persisting(int(device.index), arena.used)
+        self._persisting = arena is not None and arena.used > 0
+        if self._persisting:
+            try:
+                runtime.driver().reserve_persisting(int(device.index), arena.used)
+            except KernelError:
+                self._persisting = False
         self._mixer_width = mixer_width
         self._kv_width = max(kv_width, 1)
         self._max_chunks = max_chunks
@@ -263,7 +273,7 @@ class KernelDecoder(StaticDecoder):
 
     @property
     def persisted_bytes(self) -> int:
-        return 0 if self.arena is None else self.arena.used
+        return self.arena.used if self._persisting and self.arena is not None else 0
 
     @property
     def tile_prefill(self) -> bool:
@@ -464,10 +474,10 @@ class KernelDecoder(StaticDecoder):
             return captured
         saved_position = int(self.position)
         saved_valid = int(self.tile_valid)
-        stream = torch.cuda.Stream(device=self.device)
-        stream.wait_stream(torch.cuda.current_stream(self.device))
-        self._prepare_stream(stream)
         try:
+            stream = torch.cuda.Stream(device=self.device)
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+            self._prepare_stream(stream)
             self.tile_valid.fill_(TILE)
             with torch.cuda.stream(stream):
                 for _ in range(max(1, warmup_steps)):
@@ -488,10 +498,41 @@ class KernelDecoder(StaticDecoder):
         return captured
 
     def _persist(self, stream: int) -> None:
-        if self.arena is None or self.arena.used == 0 or self._persisted_stream == stream:
+        if not self._persisting or self._persisted_stream == stream:
             return
-        runtime.driver().persist_on_stream(stream, self.arena.base, self.arena.used)
+        try:
+            runtime.driver().persist_on_stream(stream, self.arena.base, self.arena.used)
+        except KernelError:
+            self._persisting = False
+            return
         self._persisted_stream = stream
+
+    @torch.no_grad()
+    def self_check(self) -> None:
+        """Run one prompt through the prefill and through single steps and require both to agree.
+
+        The two paths share no matrix kernel, so a GPU the kernels do not run
+        correctly on fails here, while loading, instead of in a chat.
+        """
+
+        vocab = int(self.model.config.vocab_size)
+        length = min(TILE + TILE // 2 + 1, self.max_len)
+        ids = torch.randint(2, vocab, (1, length), generator=torch.Generator().manual_seed(0))
+        whole = self.prefill(ids).clone()
+        self.prefill(ids[:, :1])
+        for index in range(1, length):
+            self.step(ids[:, index])
+        stepped = self.logits.clone()
+        sampled = int(self.token[0])
+        self.reset()
+        scale = float(whole.norm())
+        if not (bool(torch.isfinite(whole).all()) and bool(torch.isfinite(stepped).all())) or scale == 0.0:
+            raise KernelError("the ternary kernels produced invalid numbers on this GPU")
+        difference = float((whole - stepped).norm()) / scale
+        if difference > SELF_CHECK_TOLERANCE:
+            raise KernelError(f"the ternary kernels disagree with themselves on this GPU ({difference:.1e})")
+        if not 0 <= sampled < vocab:
+            raise KernelError("the ternary sampler returned an invalid token on this GPU")
 
     def _prepare_stream(self, stream: torch.cuda.Stream) -> None:
         runtime.driver().bind(int(self.device.index))
@@ -526,23 +567,36 @@ class KernelDecoder(StaticDecoder):
             name += "_wide"
         return Launch(self._module.kernel(name), (matrix.grid, 1, 1), (THREADS, 1, 1), args)
 
-    def _quantize(self, name: str, source: Tensor, aux: Tensor | None, width: int, eps: float = 1e-6, splits: int = 1) -> Launch:
+    def _quantize(self, name: str, source: Tensor, aux: Tensor | None, width: int, eps: float = 1e-6) -> Launch:
         args = [
-            pointer(source), pointer(aux), int32(width), float32(eps), int32(splits),
+            pointer(source), pointer(aux), int32(width), float32(eps), int32(1),
             pointer(self.q8), pointer(self.q8sum), pointer(self.q8scale),
         ]
         if width > NARROW_WIDTH:
             name += "_wide"
         return Launch(self._module.kernel(name), (1, 1, 1), (THREADS, 1, 1), args)
 
-    def _sampler(self, vocab: int) -> Launch:
-        args = [
+    def _sampler(self, vocab: int) -> list[Launch]:
+        groups = (vocab + BOUND_GROUP - 1) // BOUND_GROUP
+        self.bounds = torch.zeros(groups, dtype=torch.float32, device=self.device)
+        bounds_args = [
             pointer(self.logits), pointer(self.temperature), pointer(self.penalty), pointer(self.inverse_penalty),
-            pointer(self.seen), pointer(self.top_k), pointer(self.uniform), pointer(self.token), int32(vocab),
+            pointer(self.seen), pointer(self.bounds), int32(vocab),
         ]
-        return Launch(self._module.kernel("sample_token"), (1, 1, 1), (SAMPLE_THREADS, 1, 1), args)
+        sample_args = [
+            pointer(self.logits), pointer(self.bounds), pointer(self.temperature), pointer(self.penalty),
+            pointer(self.inverse_penalty), pointer(self.seen), pointer(self.top_k), pointer(self.uniform),
+            pointer(self.token), int32(vocab),
+        ]
+        return [
+            Launch(self._module.kernel("logit_bounds"), (groups, 1, 1), (BOUND_GROUP, 1, 1), bounds_args),
+            Launch(self._module.kernel("sample_token"), (1, 1, 1), (SAMPLE_THREADS, 1, 1), sample_args),
+        ]
 
     def _recurrent(self, index: int, mixer: RecurrentMixer, hidden: int) -> Launch:
+        dims = mixer.head_dim
+        while dims > RECURRENT_DIMS and dims % 2 == 0 and (dims // 2) * mixer.state_dim >= 32:
+            dims //= 2
         state = self.recurrent_states[index]
         device = self.device
         decay = (-F.softplus(mixer.log_decay.float())).contiguous().to(device)
@@ -556,11 +610,12 @@ class KernelDecoder(StaticDecoder):
             pointer(decay), pointer(theta), pointer(skip), pointer(state["ssm_state"]), pointer(state["prev_force"]),
             pointer(self.mixer_out), int32(hidden), int32(mixer.state_dim), int32(mixer.head_dim),
             int32(mixer.conv_kernel_size), float32(0.5 * mixer.dt_min), float32(0.5 * (mixer.dt_max - mixer.dt_min)),
+            int32(dims),
         ]
         return Launch(
             self._module.kernel("recurrent_step"),
-            (mixer.num_heads, 1, 1),
-            (mixer.state_dim * mixer.head_dim, 1, 1),
+            (mixer.num_heads, mixer.head_dim // dims, 1),
+            (mixer.state_dim * dims, 1, 1),
             args,
         )
 
@@ -577,12 +632,14 @@ class KernelDecoder(StaticDecoder):
         return Launch(self._module.kernel("attention_step"), (heads, self.splits, 1), (ATTENTION_THREADS, 1, 1), args)
 
     def _sample(self) -> None:
-        if self._sample_launch is None:
+        if not self._sample_launches:
             super()._sample()
             return
         runtime.driver().bind(int(self.device.index))
         self.uniform.uniform_()
-        self._sample_launch(torch.cuda.current_stream(self.device).cuda_stream)
+        stream = torch.cuda.current_stream(self.device).cuda_stream
+        for launch in self._sample_launches:
+            launch(stream)
 
     def _step(self, length: int) -> None:
         runtime.driver().bind(int(self.device.index))
