@@ -12,13 +12,13 @@ Project: [ivonar.com](https://ivonar.com/)
 macOS and Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LuisCode28/ivonar-inference/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/LuisOezdem/ivonar-inference/main/install.sh | sh
 ```
 
 Windows, in PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/LuisCode28/ivonar-inference/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/LuisOezdem/ivonar-inference/main/install.ps1 | iex
 ```
 
 The command installs [uv](https://docs.astral.sh/uv/) with its own Python, then

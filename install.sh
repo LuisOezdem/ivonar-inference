@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-PACKAGE=${IVONAR_PACKAGE:-https://github.com/LuisCode28/ivonar-inference/archive/refs/heads/main.tar.gz}
+PACKAGE=${IVONAR_PACKAGE:-https://github.com/LuisOezdem/ivonar-inference/archive/refs/heads/main.tar.gz}
 TORCH_BACKEND=${IVONAR_TORCH_BACKEND:-auto}
 
 if ! command -v uv >/dev/null 2>&1; then

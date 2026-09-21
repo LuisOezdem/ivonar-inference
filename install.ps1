@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$package = if ($env:IVONAR_PACKAGE) { $env:IVONAR_PACKAGE } else { "https://github.com/LuisCode28/ivonar-inference/archive/refs/heads/main.tar.gz" }
+$package = if ($env:IVONAR_PACKAGE) { $env:IVONAR_PACKAGE } else { "https://github.com/LuisOezdem/ivonar-inference/archive/refs/heads/main.tar.gz" }
 $backend = if ($env:IVONAR_TORCH_BACKEND) { $env:IVONAR_TORCH_BACKEND } else { "auto" }
 
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
